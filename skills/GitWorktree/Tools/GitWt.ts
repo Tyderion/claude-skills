@@ -36,10 +36,13 @@ const USAGE = `git-wt — bare-repo worktree containers
       tracks origin/<branch>, else creates <branch> from --from (default: the
       default branch). Then links shared files into it.
 
-  git-wt sync [-C <container>]
-      Link every path in .shared into every worktree, git-exclude them, and remove
-      links for paths no longer listed. Plans first; any conflict (a real file
-      where a link belongs) aborts the whole sync with nothing changed.
+  git-wt sync [--reset <path>] [-C <container>]
+      Apply .shared to every worktree. Bare lines and [link] entries become symlinks
+      to the container root; [copy] entries are copied once and then belong to the
+      worktree. Everything listed is git-excluded. Links for paths no longer listed
+      are removed; copies are kept (and stay excluded). --reset <path> replaces every
+      worktree's copy of a [copy] entry with the root default. Plans first; any
+      conflict aborts the whole sync with nothing changed.
 `;
 
 class Fail extends Error {}
@@ -88,7 +91,17 @@ function initContainerFiles(container: string) {
   writeFileSync(join(container, ".git"), "gitdir: ./.bare\n");
   const shared = join(container, ".shared");
   if (!existsSync(shared)) {
-    writeFileSync(shared, "# Paths shared by every worktree, relative to a worktree root. One per line.\n# The real file lives here in the container; `git-wt sync` symlinks it into each worktree.\n");
+    writeFileSync(shared, [
+      "# Paths shared by every worktree, relative to a worktree root. One per line; apply with `git-wt sync`.",
+      "# The default lives here in the container root.",
+      "# [link] (also any line before a header): every worktree symlinks the one real file.",
+      "# [copy]: each worktree gets its own copy once, then edits stay local. `git-wt sync --reset <path>` re-copies.",
+      "",
+      "[link]",
+      "",
+      "[copy]",
+      "",
+    ].join("\n"));
   }
 }
 
@@ -123,30 +136,47 @@ function defaultBranch(container: string): string {
 const BLOCK_START = "# >>> git-wt shared (managed by git-wt sync; edit .shared instead)";
 const BLOCK_END = "# <<< git-wt shared";
 
-export function readShared(container: string): string[] {
+/** `.shared`: bare lines and `[link]` entries are symlinked, `[copy]` entries are copied once. */
+export type Shared = { link: string[]; copy: string[] };
+
+export function readShared(container: string): Shared {
   const file = join(container, ".shared");
-  if (!existsSync(file)) return [];
-  const entries: string[] = [];
+  const shared: Shared = { link: [], copy: [] };
+  if (!existsSync(file)) return shared;
+  let section: keyof Shared = "link";
   for (const raw of readFileSync(file, "utf8").split("\n")) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
+    const header = /^\[(.*)\]$/.exec(line);
+    if (header) {
+      const name = header[1].trim().toLowerCase();
+      if (name !== "link" && name !== "copy") fail(`.shared: unknown section [${header[1]}]; use [link] or [copy]`);
+      section = name;
+      continue;
+    }
     const p = normalize(line).replace(/\/+$/, "");
     if (isAbsolute(p) || p === "." || p === ".." || p.startsWith(`..${sep}`)) fail(`.shared: "${line}" must be a relative path inside the worktree`);
     if ([".git", ".bare", ".shared"].includes(p.split(sep)[0])) fail(`.shared: "${line}" collides with git-wt's own files`);
-    if (!entries.includes(p)) entries.push(p);
+    const other = section === "link" ? "copy" : "link";
+    if (shared[other].includes(p)) fail(`.shared: "${p}" is listed under both [link] and [copy]`);
+    if (!shared[section].includes(p)) shared[section].push(p);
   }
-  // A link for `a` would make `a/b` resolve through it into the root copy itself.
-  for (const a of entries) for (const b of entries) {
+  // A link for `a` would make `a/b` resolve through it into the root copy itself,
+  // and a copied `a` would already contain `a/b`.
+  const all = [...shared.link, ...shared.copy];
+  for (const a of all) for (const b of all) {
     if (b.startsWith(a + sep)) fail(`.shared: "${b}" is inside "${a}", which is already shared; list only one of them`);
   }
-  return entries;
+  return shared;
 }
 
 function excludeFile(container: string) {
   return join(git(container, "rev-parse", "--path-format=absolute", "--git-common-dir"), "info", "exclude");
 }
 
-function readManagedBlock(container: string): { before: string; entries: string[]; after: string } {
+type Block = Shared & { before: string; after: string };
+
+function readManagedBlock(container: string): Block {
   const file = excludeFile(container);
   const text = existsSync(file) ? readFileSync(file, "utf8") : "";
   const s = text.indexOf(BLOCK_START);
@@ -154,63 +184,86 @@ function readManagedBlock(container: string): { before: string; entries: string[
   const odd = (why: string) => fail(`${file}: ${why}. Fix the git-wt block by hand (or delete both marker lines and everything between), then rerun`);
   if (s < 0) {
     if (text.includes(BLOCK_END)) odd("end marker without a start marker");
-    return { before: text, entries: [], after: "" };
+    return { before: text, after: "", link: [], copy: [] };
   }
   if (e < 0) odd("start marker without an end marker");
   if (text.indexOf(BLOCK_START, s + 1) >= 0 || text.indexOf(BLOCK_END, e + 1) >= 0) odd("more than one git-wt block");
-  const lines = text.slice(s + BLOCK_START.length, e).split("\n").map((l) => l.trim()).filter(Boolean);
-  if (lines.some((l) => !l.startsWith("/"))) odd("unexpected lines inside the git-wt block");
-  const entries = lines.map((l) => l.slice(1).replace(/\\(.)/g, "$1"));
-  return { before: text.slice(0, s), entries, after: text.slice(e + BLOCK_END.length).replace(/^\n/, "") };
+  const block: Block = { before: text.slice(0, s), after: text.slice(e + BLOCK_END.length).replace(/^\n/, ""), link: [], copy: [] };
+  let section: keyof Shared = "link"; // blocks written before [copy] existed hold only links
+  for (const l of text.slice(s + BLOCK_START.length, e).split("\n").map((l) => l.trim()).filter(Boolean)) {
+    if (l === "# link" || l === "# copy") section = l.slice(2) as keyof Shared;
+    else if (l.startsWith("/")) block[section].push(l.slice(1).replace(/\\(.)/g, "$1"));
+    else odd("unexpected lines inside the git-wt block");
+  }
+  return block;
 }
 
-function writeManagedBlock(container: string, entries: string[]) {
+function writeManagedBlock(container: string, { link, copy }: Shared) {
   const file = excludeFile(container);
   const { before, after } = readManagedBlock(container);
-  const escaped = entries.map((p) => "/" + p.replace(/([\\*?[\]!#])/g, "\\$1"));
-  const block = entries.length ? `${BLOCK_START}\n${escaped.join("\n")}\n${BLOCK_END}\n` : "";
+  const esc = (p: string) => "/" + p.replace(/([\\*?[\]!#])/g, "\\$1");
+  const body = [
+    ...(link.length ? ["# link", ...link.map(esc)] : []),
+    ...(copy.length ? ["# copy", ...copy.map(esc)] : []),
+  ];
+  const block = body.length ? `${BLOCK_START}\n${body.join("\n")}\n${BLOCK_END}\n` : "";
   const head = before && !before.endsWith("\n") ? before + "\n" : before;
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, head + block + after);
 }
 
-type Action = { kind: "link" | "unlink"; path: string; target: string };
+type Action = { kind: "link" | "unlink" | "copy" | "reset"; path: string; target: string };
 
-export function sync(container: string, only?: string[]): { actions: Action[]; warnings: string[] } {
-  const entries = readShared(container);
-  const previous = readManagedBlock(container).entries;
-  const removed = previous.filter((p) => !entries.includes(p));
-  const trees = worktrees(container).filter((w) => !only || only.includes(w.path));
+const union = (...lists: string[][]) => [...new Set(lists.flat())];
+
+export function sync(container: string, opts: { only?: string[]; reset?: string } = {}): { actions: Action[]; warnings: string[] } {
+  const { only } = opts;
+  const { link, copy } = readShared(container);
+  const reset = opts.reset === undefined ? undefined : normalize(opts.reset).replace(/\/+$/, "");
+  if (reset !== undefined && !copy.includes(reset)) fail(`--reset ${reset}: not listed under [copy] in .shared`);
+  const previous = readManagedBlock(container);
+  const removedLinks = previous.link.filter((p) => !link.includes(p));
+  const all = worktrees(container);
+  const trees = all.filter((w) => !only || only.includes(w.path));
 
   const actions: Action[] = [];
   const conflicts: string[] = [];
   const warnings: string[] = [];
+  const pointsAt = (path: string, real: string) => resolve(dirname(path), readlinkSync(path)) === real;
 
-  for (const entry of entries) {
-    if (!lstatOrNull(join(container, entry))) warnings.push(`${entry}: not present in the container root yet, no links made`);
+  for (const entry of [...link, ...copy]) {
+    if (!lstatOrNull(join(container, entry))) warnings.push(`${entry}: not present in the container root yet, nothing linked or copied`);
   }
 
   for (const wt of trees) {
-    for (const entry of entries) {
-      const real = join(container, entry);
-      if (!lstatOrNull(real)) continue;
-      const link = join(wt.path, entry);
-      const target = relative(dirname(link), real);
-      const st = lstatOrNull(link);
-      if (!st) { actions.push({ kind: "link", path: link, target }); continue; }
-      if (st.isSymbolicLink()) {
-        const cur = readlinkSync(link);
-        if (resolve(dirname(link), cur) === real) continue;
-        conflicts.push(`${link}: symlink points at ${cur}, not the shared ${real}`);
-      } else {
-        conflicts.push(`${link}: a real ${st.isDirectory() ? "directory" : "file"} sits where the shared link belongs`);
+    // Unlinks first: an entry moved from [link] to [copy] is unlinked, then copied.
+    for (const entry of removedLinks) {
+      const path = join(wt.path, entry);
+      if (lstatOrNull(path)?.isSymbolicLink() && pointsAt(path, join(container, entry))) {
+        actions.push({ kind: "unlink", path, target: readlinkSync(path) });
       }
     }
-    for (const entry of removed) {
-      const link = join(wt.path, entry);
-      const st = lstatOrNull(link);
-      if (st?.isSymbolicLink() && resolve(dirname(link), readlinkSync(link)) === join(container, entry)) {
-        actions.push({ kind: "unlink", path: link, target: readlinkSync(link) });
+    for (const entry of link) {
+      const real = join(container, entry);
+      if (!lstatOrNull(real)) continue;
+      const path = join(wt.path, entry);
+      const st = lstatOrNull(path);
+      if (!st) actions.push({ kind: "link", path, target: relative(dirname(path), real) });
+      else if (st.isSymbolicLink()) {
+        if (!pointsAt(path, real)) conflicts.push(`${path}: symlink points at ${readlinkSync(path)}, not the shared ${real}`);
+      } else conflicts.push(`${path}: a real ${st.isDirectory() ? "directory" : "file"} sits where the shared link belongs`);
+    }
+    for (const entry of copy) {
+      const real = join(container, entry);
+      if (!lstatOrNull(real)) continue;
+      const path = join(wt.path, entry);
+      const st = lstatOrNull(path);
+      const beingUnlinked = actions.some((a) => a.kind === "unlink" && a.path === path);
+      if (!st || beingUnlinked) actions.push({ kind: "copy", path, target: real });
+      else if (st.isSymbolicLink()) conflicts.push(`${path}: a symlink sits where the worktree's own copy belongs`);
+      // A real file is this worktree's own version; only --reset replaces it.
+      else if (entry === reset && !run("diff", ["-rq", "--no-dereference", real, path], undefined, true).ok) {
+        actions.push({ kind: "reset", path, target: real });
       }
     }
   }
@@ -220,21 +273,31 @@ export function sync(container: string, only?: string[]): { actions: Action[]; w
   }
 
   for (const a of actions) {
-    if (a.kind === "link") {
+    if (a.kind === "unlink") unlinkSync(a.path);
+    else if (a.kind === "link") {
       mkdirSync(dirname(a.path), { recursive: true });
       symlinkSync(a.target, a.path);
     } else {
-      unlinkSync(a.path);
+      if (a.kind === "reset") rmSync(a.path, { recursive: true });
+      mkdirSync(dirname(a.path), { recursive: true });
+      run("cp", ["-a", "--reflink=auto", a.target, a.path]); // free on btrfs/xfs until edited
     }
   }
-  // Only shrink the managed block when every worktree was visited, so a single-worktree
-  // sync (from `add`) can't forget entries other worktrees still need pruned.
-  writeManagedBlock(container, only ? [...new Set([...previous, ...entries])] : entries);
+
+  // Only shrink the block when every worktree was visited, so a single-worktree sync (from
+  // `add`) can't forget links other worktrees still need pruned. Copies stay excluded while
+  // any worktree still holds one, even after leaving .shared, so they never turn untracked.
+  const stillCopied = previous.copy.filter((p) => !link.includes(p) && all.some((w) => lstatOrNull(join(w.path, p))));
+  writeManagedBlock(container, {
+    link: only ? union(previous.link, link) : link,
+    copy: only ? union(previous.copy, copy) : union(copy, stillCopied),
+  });
+
   // info/exclude has the lowest precedence: a `!path` in a tracked .gitignore wins over it.
   for (const wt of trees) {
-    for (const entry of entries) {
-      if (lstatOrNull(join(wt.path, entry))?.isSymbolicLink() && !gitTry(wt.path, "check-ignore", "-q", "--no-index", entry).ok) {
-        warnings.push(`${join(wt.path, entry)}: not ignored (a .gitignore rule re-includes it), so it shows as untracked; git add -A would commit the link`);
+    for (const entry of [...link, ...copy]) {
+      if (lstatOrNull(join(wt.path, entry)) && !gitTry(wt.path, "check-ignore", "-q", "--no-index", entry).ok) {
+        warnings.push(`${join(wt.path, entry)}: not ignored (a .gitignore rule re-includes it), so it shows as untracked; git add -A would commit it`);
       }
     }
   }
@@ -242,9 +305,10 @@ export function sync(container: string, only?: string[]): { actions: Action[]; w
 }
 
 function reportSync(r: { actions: Action[]; warnings: string[] }) {
-  for (const a of r.actions) log(`${a.kind === "link" ? "linked  " : "unlinked"} ${a.path} -> ${a.target}`);
+  const verb = { link: "linked  ", unlink: "unlinked", copy: "copied  ", reset: "reset   " };
+  for (const a of r.actions) log(`${verb[a.kind]} ${a.path}${a.kind === "link" || a.kind === "unlink" ? ` -> ${a.target}` : ""}`);
   for (const w of r.warnings) log(`warning: ${w}`);
-  if (!r.actions.length) log("shared links already up to date");
+  if (!r.actions.length) log("shared files already up to date");
 }
 
 // ---------------------------------------------------------------- clone
@@ -311,7 +375,7 @@ export function add(container: string, branch: string, from?: string): string {
     git(container, "worktree", "add", "--no-track", "-b", branch, folder, start);
     log(`created new branch ${branch} from ${start}`);
   }
-  reportSync(sync(container, [folder]));
+  reportSync(sync(container, { only: [folder] }));
   log(`worktree ${flatten(branch)}/ on ${branch}`);
   return folder;
 }
@@ -541,9 +605,9 @@ function main(argv: string[]) {
       if (pos.length !== 1) fail("usage: git-wt add <branch> [--from <start>] [-C <container>]");
       return void add(findContainer(flags.C ?? process.cwd()), pos[0], flags.from);
     case "sync":
-      allow("C");
-      if (pos.length) fail("usage: git-wt sync [-C <container>]");
-      return reportSync(sync(findContainer(flags.C ?? process.cwd())));
+      allow("C", "reset");
+      if (pos.length) fail("usage: git-wt sync [--reset <path>] [-C <container>]");
+      return reportSync(sync(findContainer(flags.C ?? process.cwd()), { reset: flags.reset }));
     default:
       fail(`unknown command "${cmd}"\n\n${USAGE}`);
   }

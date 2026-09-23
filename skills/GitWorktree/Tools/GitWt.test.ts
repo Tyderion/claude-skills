@@ -212,6 +212,100 @@ describe("clone + add + sync", () => {
   });
 });
 
+describe("[copy] entries", () => {
+  let c: string;
+  const trees = ["master", "feature-x"];
+  const shared = (text: string) => writeFileSync(join(c, ".shared"), text);
+
+  beforeAll(() => {
+    c = join(root, "copyproj");
+    expect(wt(root, "clone", makeRemote("copyrem"), "--dir", c).code).toBe(0);
+    expect(wt(c, "add", "feature/x").code).toBe(0);
+    writeFileSync(join(c, "app.yaml"), "port: 1\n");
+    writeFileSync(join(c, ".env"), "S=1\n");
+  });
+
+  test("copies once per worktree, excluded from git, next to [link] entries", () => {
+    shared("[link]\n.env\n[copy]\napp.yaml\n");
+    const r = wt(c, "sync");
+    expect(r.code).toBe(0);
+    for (const w of trees) {
+      const st = lstatSync(join(c, w, "app.yaml"));
+      expect(st.isFile() && !st.isSymbolicLink()).toBe(true);
+      expect(readFileSync(join(c, w, "app.yaml"), "utf8")).toBe("port: 1\n");
+      expect(lstatSync(join(c, w, ".env")).isSymbolicLink()).toBe(true);
+      expect(git(join(c, w), "status", "--porcelain")).toBe("");
+    }
+    expect(r.out).toContain("copied");
+  });
+
+  test("a new worktree gets its copy on add", () => {
+    expect(wt(c, "add", "third").code).toBe(0);
+    expect(readFileSync(join(c, "third", "app.yaml"), "utf8")).toBe("port: 1\n");
+    trees.push("third");
+  });
+
+  test("existing copies are never overwritten, until --reset", () => {
+    writeFileSync(join(c, "master", "app.yaml"), "port: 2\n"); // worktree's own edit
+    writeFileSync(join(c, "app.yaml"), "port: 3\n"); // new root default
+    expect(wt(c, "sync").out).toContain("already up to date");
+    expect(readFileSync(join(c, "master", "app.yaml"), "utf8")).toBe("port: 2\n");
+
+    writeFileSync(join(c, "feature-x", "app.yaml"), "port: 3\n"); // already equal to root
+    const r = wt(c, "sync", "--reset", "app.yaml");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`reset    ${join(c, "master", "app.yaml")}`);
+    expect(r.out).not.toContain(join(c, "feature-x", "app.yaml")); // identical: skipped
+    for (const w of trees) expect(readFileSync(join(c, w, "app.yaml"), "utf8")).toBe("port: 3\n");
+  });
+
+  test("--reset only accepts [copy] entries", () => {
+    const r = wt(c, "sync", "--reset", ".env");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("not listed under [copy]");
+  });
+
+  test("moving an entry from [link] to [copy] swaps each link for a real copy", () => {
+    shared("[copy]\napp.yaml\n.env\n");
+    expect(wt(c, "sync").code).toBe(0);
+    for (const w of trees) {
+      expect(lstatSync(join(c, w, ".env")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(c, w, ".env"), "utf8")).toBe("S=1\n");
+      expect(git(join(c, w), "status", "--porcelain")).toBe("");
+    }
+  });
+
+  test("moving an entry from [copy] to [link] stops on the real copies", () => {
+    shared(".env\n[copy]\napp.yaml\n");
+    const r = wt(c, "sync");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("a real file sits where the shared link belongs");
+    shared("[copy]\napp.yaml\n.env\n");
+  });
+
+  test("removed copies stay on disk and stay excluded until they are gone everywhere", () => {
+    shared("[copy]\n.env\n");
+    expect(wt(c, "sync").code).toBe(0);
+    const exclude = () => readFileSync(join(c, ".bare", "info", "exclude"), "utf8");
+    for (const w of trees) {
+      expect(readFileSync(join(c, w, "app.yaml"), "utf8")).toBe("port: 3\n");
+      expect(git(join(c, w), "status", "--porcelain")).toBe("");
+    }
+    expect(exclude()).toContain("/app.yaml");
+    for (const w of trees) rmSync(join(c, w, "app.yaml"));
+    expect(wt(c, "sync").code).toBe(0);
+    expect(exclude()).not.toContain("/app.yaml");
+  });
+
+  test(".shared rejects unknown sections and entries listed twice", () => {
+    shared("[copies]\napp.yaml\n");
+    expect(wt(c, "sync").err).toContain("unknown section [copies]");
+    shared(".env\n[copy]\n.env\n");
+    expect(wt(c, "sync").err).toContain("under both [link] and [copy]");
+    shared("[copy]\n.env\n");
+  });
+});
+
 describe("convert", () => {
   function checkout(name: string) {
     const dir = join(root, name);

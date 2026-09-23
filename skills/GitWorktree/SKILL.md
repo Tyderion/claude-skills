@@ -19,7 +19,9 @@ Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/GitWorktree/PREFERENCES.md` if
 | Clone a URL into the layout | `git-wt clone <url> [--dir <path>] [--base <dir>] [--name <name>]` |
 | Convert an existing normal checkout | `git-wt convert [<path>]` |
 | New worktree for a branch | `git-wt add <branch> [--from <start>] [-C <container>]` |
-| Share a file across worktrees | move it to the container root, add its path to `<container>/.shared`, then `git-wt sync` |
+| Share one file across worktrees (edits visible everywhere) | move it to the container root, list it under `[link]` in `<container>/.shared`, then `git-wt sync` |
+| Give each worktree its own editable copy of a default | put the default in the container root, list it under `[copy]`, then `git-wt sync` |
+| Throw away a worktree's edits to a copied file | `git-wt sync --reset <path>` (replaces every diverged copy with the root default) |
 
 Base directory for `clone` defaults to `$GIT_WT_BASE`, else `~/coding`. Worktree folders are the branch name with `/` → `-` (`feature/x` → `feature-x/`).
 
@@ -45,6 +47,7 @@ User: "both worktrees should use the same .env"
 ## Gotchas
 
 - **Sync never overwrites a real file.** A real file where a shared link belongs aborts the whole sync with nothing changed. Resolving it (which copy wins, where it moves) is the principal's call; report the conflict and ask.
+- **`[copy]` files are copied once, then belong to the worktree.** Sync never overwrites an existing copy; only `--reset` does, and it skips copies identical to the root. Removing an entry from `[copy]` leaves the files and keeps them git-excluded until no worktree has one. To commit a copied file, find it under `# copy` in the managed block of `.bare/info/exclude` and `git add -f` it.
 - **Shared paths are git-excluded automatically** via a managed block in `.bare/info/exclude`, which is shared by all worktrees. Edit `.shared`, never that block.
 - **`info/exclude` has the lowest precedence.** A `!path` in a tracked `.gitignore` re-includes a shared link, so it shows as untracked and `git add -A` would commit the symlink. `sync` warns per worktree when this happens; the fix is in that repo's `.gitignore`.
 - **`convert` refuses** uncommitted tracked changes, detached HEAD, in-progress merge/rebase, submodules, and repos that already have linked worktrees (stale ones are pruned first). Untracked and ignored files are carried over. Sparse checkouts (`extensions.worktreeConfig`) work: `core.bare` goes into `.bare/config.worktree`, and the old sparse settings and patterns move to the new worktree.
