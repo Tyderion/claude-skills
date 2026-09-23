@@ -13,10 +13,11 @@
  */
 import { spawnSync } from "node:child_process";
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync,
+  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync,
   renameSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { parseArgs } from "node:util";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 const USAGE = `git-wt — bare-repo worktree containers
@@ -89,6 +90,9 @@ function findContainer(start: string): string {
 
 function initContainerFiles(container: string) {
   writeFileSync(join(container, ".git"), "gitdir: ./.bare\n");
+  // Worktree links become relative, so the whole container can be moved or renamed. Sets
+  // extensions.relativeWorktrees on the first `worktree add`; older git can't read the repo then.
+  git(container, "config", "worktree.useRelativePaths", "true");
   const shared = join(container, ".shared");
   if (!existsSync(shared)) {
     writeFileSync(shared, [
@@ -103,12 +107,6 @@ function initContainerFiles(container: string) {
       "",
     ].join("\n"));
   }
-}
-
-/** Worktree links become relative, so the whole container can be moved or renamed.
- *  Sets extensions.relativeWorktrees on the first `worktree add`; older git versions can't read the repo then. */
-function enableRelativePaths(container: string) {
-  git(container, "config", "worktree.useRelativePaths", "true");
 }
 
 type Worktree = { path: string; branch?: string };
@@ -170,9 +168,8 @@ export function readShared(container: string): Shared {
   return shared;
 }
 
-function excludeFile(container: string) {
-  return join(git(container, "rev-parse", "--path-format=absolute", "--git-common-dir"), "info", "exclude");
-}
+// Every container holds its repository at .bare (findContainer checks; clone and convert create it).
+const excludeFile = (container: string) => join(container, ".bare", "info", "exclude");
 
 type Block = Shared & { before: string; after: string };
 
@@ -198,9 +195,8 @@ function readManagedBlock(container: string): Block {
   return block;
 }
 
-function writeManagedBlock(container: string, { link, copy }: Shared) {
+function writeManagedBlock(container: string, { before, after }: Block, { link, copy }: Shared) {
   const file = excludeFile(container);
-  const { before, after } = readManagedBlock(container);
   const esc = (p: string) => "/" + p.replace(/([\\*?[\]!#])/g, "\\$1");
   const body = [
     ...(link.length ? ["# link", ...link.map(esc)] : []),
@@ -258,12 +254,15 @@ export function sync(container: string, opts: { only?: string[]; reset?: string 
       if (!lstatOrNull(real)) continue;
       const path = join(wt.path, entry);
       const st = lstatOrNull(path);
-      const beingUnlinked = actions.some((a) => a.kind === "unlink" && a.path === path);
-      if (!st || beingUnlinked) actions.push({ kind: "copy", path, target: real });
+      // Seen through a link that is about to go (the entry, or a parent dir moved from [link]).
+      const beingUnlinked = actions.some((a) => a.kind === "unlink" && (a.path === path || path.startsWith(a.path + sep)));
+      // A symlinked default would be copied as a (dangling) link; copy what it points at.
+      const source = realpathSync(real);
+      if (!st || beingUnlinked) actions.push({ kind: "copy", path, target: source });
       else if (st.isSymbolicLink()) conflicts.push(`${path}: a symlink sits where the worktree's own copy belongs`);
       // A real file is this worktree's own version; only --reset replaces it.
-      else if (entry === reset && !run("diff", ["-rq", "--no-dereference", real, path], undefined, true).ok) {
-        actions.push({ kind: "reset", path, target: real });
+      else if (entry === reset && !run("diff", ["-rq", "--no-dereference", source, path], undefined, true).ok) {
+        actions.push({ kind: "reset", path, target: source });
       }
     }
   }
@@ -288,7 +287,7 @@ export function sync(container: string, opts: { only?: string[]; reset?: string 
   // `add`) can't forget links other worktrees still need pruned. Copies stay excluded while
   // any worktree still holds one, even after leaving .shared, so they never turn untracked.
   const stillCopied = previous.copy.filter((p) => !link.includes(p) && all.some((w) => lstatOrNull(join(w.path, p))));
-  writeManagedBlock(container, {
+  writeManagedBlock(container, previous, {
     link: only ? union(previous.link, link) : link,
     copy: only ? union(previous.copy, copy) : union(copy, stillCopied),
   });
@@ -339,7 +338,6 @@ function cloneInto(container: string, url: string): string {
   run("git", ["clone", "--quiet", "--no-checkout", `--separate-git-dir=${join(container, ".bare")}`, url, container]);
   git(join(container, ".bare"), "config", "core.bare", "true");
   initContainerFiles(container); // replaces clone's absolute gitdir pointer
-  enableRelativePaths(container);
   const def = defaultBranch(container);
   if (!gitTry(container, "rev-parse", "--verify", "--quiet", `refs/heads/${def}`).ok) {
     log(`cloned into ${container}; the remote has no commits yet, so no worktree was created`);
@@ -390,7 +388,13 @@ function resumeInterrupted(path: string): void {
   for (const top of [p, p.replace(/\.pre-wt$/, ""), dirname(p)]) {
     const journal = journalFor(top);
     if (!existsSync(journal)) continue;
-    const result = rollback(JSON.parse(readFileSync(journal, "utf8")) as ConvertState);
+    let state: ConvertState;
+    try {
+      state = JSON.parse(readFileSync(journal, "utf8"));
+    } catch (e) {
+      fail(`found an interrupted convert of ${top}, but its journal ${journal} is unreadable (${(e as Error).message}). Restore by hand: the tree is ${top}.pre-wt or a folder inside ${top}, the repository ${top}/.bare or ${top}.pre-wt/.git.`);
+    }
+    const result = rollback(state!);
     if (!result.startsWith("ROLLBACK STOPPED")) rmSync(journal);
     fail(`found an interrupted convert of ${top}. ${result}${result.startsWith("ROLLBACK STOPPED") ? `\nJournal kept at ${journal}.` : "\nRun convert again."}`);
   }
@@ -428,12 +432,18 @@ export function convert(path: string): string {
     worktreeConfig: gitTry(top, "config", "--get", "--type=bool", "extensions.worktreeConfig").out === "true",
     moved: [],
     wroteBareWorktreeConfig: false,
+    // Rollback writes this back verbatim: core.bare, core.worktree, and the relative-paths
+    // extension (which older git can't read) all come off together.
+    config: readFileSync(join(gitDir, "config"), "utf8"),
   };
   const { wt, bare } = x;
   // Write-ahead: the journal records each step before it happens, so a hard kill at any
   // point leaves enough for the next run to roll back. Rollback tolerates steps not taken.
   const journal = journalFor(top);
-  const save = () => writeFileSync(journal, JSON.stringify(x));
+  const save = () => { // atomic: a kill mid-write must not leave half a journal
+    writeFileSync(`${journal}.tmp`, JSON.stringify(x));
+    renameSync(`${journal}.tmp`, journal);
+  };
   const move = (from: string, to: string) => {
     if (!existsSync(from)) return;
     x.moved.push([from, to]);
@@ -446,14 +456,24 @@ export function convert(path: string): string {
   // the listener stays for the life of the process. Ctrl-C still reaches the git child in
   // the foreground group, so that step fails and the normal rollback runs.
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => {});
-  const crash = (at: string) => { if (process.env.GIT_WT_TEST_CRASH === at) process.exit(137); };
+  // Test-only fault injection: GIT_WT_TEST=crash:<at> dies without rollback, fail:<at> throws.
+  const inject = (at: string) => {
+    const v = process.env.GIT_WT_TEST;
+    if (v === `crash:${at}`) process.exit(137);
+    if (v === `fail:${at}`) fail("injected test failure");
+  };
 
   // Every step is a rename, so nothing is copied or deleted and each step can be reversed.
   // `rename(2)` can't move a directory into its own child, hence the .pre-wt staging name.
   save();
-  renameSync(top, old);
   try {
-    crash("early");
+    renameSync(top, old);
+  } catch (e) {
+    rmSync(journal, { force: true }); // nothing has changed yet
+    fail(`cannot rename ${top} to ${old}: ${(e as Error).message}`);
+  }
+  try {
+    inject("early");
     mkdirSync(top);
     renameSync(join(old, ".git"), bare);
     if (x.worktreeConfig) {
@@ -466,7 +486,6 @@ export function convert(path: string): string {
     }
     if (x.coreWorktree !== undefined) git(bare, "config", "--unset", "core.worktree");
     initContainerFiles(top);
-    enableRelativePaths(top);
     git(top, "worktree", "add", "--no-checkout", flat, branch);
     x.adminDir = resolve(wt, readFileSync(join(wt, ".git"), "utf8").replace(/^gitdir: /, "").trim());
     save();
@@ -474,13 +493,14 @@ export function convert(path: string): string {
     rmdirSync(wt);
     renameSync(old, wt);
     // The old index still matches the tree and keeps skip-worktree/assume-unchanged bits.
-    renameSync(join(bare, "index"), join(x.adminDir, "index"));
+    move(join(bare, "index"), join(x.adminDir, "index"));
     // The old main worktree's own settings and sparse patterns now belong to this worktree.
     move(join(bare, "config.worktree.git-wt"), join(x.adminDir, "config.worktree"));
     move(join(bare, "info", "sparse-checkout"), join(x.adminDir, "info", "sparse-checkout"));
+    // HEAD reflog is per-worktree; the old history replaces the one line `worktree add` wrote.
+    move(join(bare, "logs", "HEAD"), join(x.adminDir, "logs", "HEAD"));
 
-    crash("late");
-    if (process.env.GIT_WT_TEST_FAIL === "convert") fail("injected test failure");
+    inject("late");
     const dirty = git(wt, "status", "--porcelain", "--untracked-files=no");
     if (dirty) fail(`new worktree shows tracked changes:\n${dirty}`);
     if (git(wt, "rev-parse", "HEAD") !== head) fail("new worktree HEAD differs from the old one");
@@ -492,17 +512,7 @@ export function convert(path: string): string {
     throw new Fail(`${(e as Error).message}\n\n${result}`);
   }
   rmSync(journal, { force: true });
-  const { adminDir, coreWorktree } = x;
-
-  // HEAD reflog is per-worktree: graft the old one in front (git counts HEAD@{n} from the end).
-  const bareLog = join(bare, "logs", "HEAD");
-  const wtLog = join(adminDir, "logs", "HEAD");
-  if (existsSync(bareLog)) {
-    const combined = readFileSync(bareLog, "utf8") + (existsSync(wtLog) ? readFileSync(wtLog, "utf8") : "");
-    mkdirSync(dirname(wtLog), { recursive: true });
-    writeFileSync(wtLog, combined);
-    rmSync(bareLog);
-  }
+  const { coreWorktree } = x;
 
   // .bare/HEAD still names the branch that was checked out; point it at the remote's default.
   const originHead = gitTry(top, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
@@ -522,17 +532,19 @@ type ConvertState = {
   coreWorktree?: string; worktreeConfig: boolean;
   moved: [from: string, to: string][]; // per-worktree files relocated, in order
   wroteBareWorktreeConfig: boolean; // .bare/config.worktree is ours (holds only core.bare)
+  config: string; // the original .git/config
 };
 
 /** Reverse whatever convert got through, newest step first. Returns a status line. */
-function rollback({ top, old, wt, bare, adminDir, coreWorktree, worktreeConfig, moved, wroteBareWorktreeConfig }: ConvertState): string {
+function rollback({ top, old, wt, bare, adminDir, moved, wroteBareWorktreeConfig, config }: ConvertState): string {
   // Crashed before the first rename: nothing moved, and wt may name a real subdirectory.
   if (!existsSync(old) && lstatOrNull(join(top, ".git"))?.isDirectory()) return `Nothing to roll back: ${top} was never touched.`;
   const steps: [string, () => void][] = [
-    ["index back", () => { if (existsSync(join(adminDir, "index"))) renameSync(join(adminDir, "index"), join(bare, "index")); }],
     ["per-worktree settings back", () => {
       if (wroteBareWorktreeConfig) rmSync(join(bare, "config.worktree"), { force: true });
-      for (const [from, to] of [...moved].reverse()) if (existsSync(to)) renameSync(to, from);
+      // `to` can pre-exist (worktree add writes its own logs/HEAD), so only a missing `from`
+      // proves the rename happened; a journaled-but-not-done move must not clobber it.
+      for (const [from, to] of [...moved].reverse()) if (existsSync(to) && !existsSync(from)) renameSync(to, from);
     }],
     ["tree back", () => { if (!existsSync(old) && existsSync(wt)) renameSync(wt, old); }],
     ["worktree registration", () => {
@@ -543,8 +555,7 @@ function rollback({ top, old, wt, bare, adminDir, coreWorktree, worktreeConfig, 
     }],
     ["repository back", () => {
       if (existsSync(bare)) {
-        if (!worktreeConfig) run("git", ["--git-dir", bare, "config", "core.bare", "false"]);
-        if (coreWorktree !== undefined) run("git", ["--git-dir", bare, "config", "core.worktree", coreWorktree]);
+        writeFileSync(join(bare, "config"), config);
         renameSync(bare, join(old, ".git"));
       }
     }],
@@ -565,51 +576,41 @@ function rollback({ top, old, wt, bare, adminDir, coreWorktree, worktreeConfig, 
 
 // ---------------------------------------------------------------- cli
 
-function parse(argv: string[]) {
-  const flags: Record<string, string> = {};
-  const pos: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "-h" || a === "--help") flags.help = "1";
-    else if (a.startsWith("--") && a.includes("=")) {
-      const eq = a.indexOf("=");
-      flags[a.slice(2, eq)] = a.slice(eq + 1);
-    } else if (a === "-C" || a.startsWith("--")) {
-      const key = a === "-C" ? "C" : a.slice(2);
-      const val = argv[++i];
-      if (val === undefined) fail(`${a} needs a value`);
-      flags[key] = val;
-    } else pos.push(a);
-  }
-  return { flags, pos };
-}
+const str = { type: "string" } as const;
+const container = { type: "string", short: "C" } as const;
+const OPTIONS = {
+  clone: { dir: str, base: str, name: str },
+  convert: {},
+  add: { from: str, C: container },
+  sync: { reset: str, C: container },
+} as const;
 
 function main(argv: string[]) {
   const [cmd, ...rest] = argv;
-  const { flags, pos } = parse(rest);
-  if (!cmd || cmd === "-h" || cmd === "--help" || flags.help) return log(USAGE);
-  const allow = (...keys: string[]) => {
-    for (const k of Object.keys(flags)) if (!keys.includes(k)) fail(`unknown option for ${cmd}: ${k.length === 1 ? "-" : "--"}${k}`);
-  };
+  if (!cmd || cmd === "-h" || cmd === "--help") return log(USAGE);
+  if (!(cmd in OPTIONS)) fail(`unknown command "${cmd}"\n\n${USAGE}`);
+  let parsed;
+  try {
+    parsed = parseArgs({ args: rest, options: { ...OPTIONS[cmd as keyof typeof OPTIONS], help: { type: "boolean", short: "h" } }, allowPositionals: true, strict: true });
+  } catch (e) {
+    fail(`${cmd}: ${(e as Error).message}`);
+  }
+  const { values, positionals: pos } = parsed!;
+  if (values.help) return log(USAGE);
+  const flags = values as Record<string, string | undefined>;
   switch (cmd) {
     case "clone":
-      allow("dir", "base", "name");
       if (pos.length !== 1) fail("usage: git-wt clone <url> [--dir <path>] [--base <dir>] [--name <name>]");
       return void clone(pos[0], { dir: flags.dir, base: flags.base, name: flags.name });
     case "convert":
-      allow();
       if (pos.length > 1) fail("usage: git-wt convert [<path>]");
       return void convert(pos[0] ?? process.cwd());
     case "add":
-      allow("from", "C");
       if (pos.length !== 1) fail("usage: git-wt add <branch> [--from <start>] [-C <container>]");
       return void add(findContainer(flags.C ?? process.cwd()), pos[0], flags.from);
     case "sync":
-      allow("C", "reset");
       if (pos.length) fail("usage: git-wt sync [--reset <path>] [-C <container>]");
       return reportSync(sync(findContainer(flags.C ?? process.cwd()), { reset: flags.reset }));
-    default:
-      fail(`unknown command "${cmd}"\n\n${USAGE}`);
   }
 }
 

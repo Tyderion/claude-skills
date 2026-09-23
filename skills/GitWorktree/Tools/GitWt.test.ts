@@ -13,8 +13,8 @@ const env = {
 };
 let root: string;
 
-function sh(cmd: string, args: string[], cwd: string) {
-  const r = spawnSync(cmd, args, { cwd, env, encoding: "utf8" });
+function sh(cmd: string, args: string[], cwd: string, extraEnv: Record<string, string> = {}) {
+  const r = spawnSync(cmd, args, { cwd, env: { ...env, ...extraEnv }, encoding: "utf8" });
   return { code: r.status, out: (r.stdout ?? "").trim(), err: (r.stderr ?? "").trim() };
 }
 const git = (cwd: string, ...a: string[]) => {
@@ -23,6 +23,8 @@ const git = (cwd: string, ...a: string[]) => {
   return r.out;
 };
 const wt = (cwd: string, ...a: string[]) => sh("bun", [TOOL, ...a], cwd);
+/** Convert with test fault injection: GIT_WT_TEST=crash:<at> | fail:<at>. */
+const convertWith = (inject: string, dir: string) => sh("bun", [TOOL, "convert", dir], root, { GIT_WT_TEST: inject });
 
 /** A remote with master (2 commits) and feature/x, plus a .gitignore for .env. */
 function makeRemote(name: string) {
@@ -297,6 +299,36 @@ describe("[copy] entries", () => {
     expect(exclude()).not.toContain("/app.yaml");
   });
 
+  test("a symlinked root default is copied as the file it points at", () => {
+    writeFileSync(join(c, "real.json"), "{}\n");
+    symlinkSync("real.json", join(c, "alias.json"));
+    shared("[copy]\n.env\nalias.json\n");
+    expect(wt(c, "sync").code).toBe(0);
+    for (const w of trees) {
+      expect(lstatSync(join(c, w, "alias.json")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(c, w, "alias.json"), "utf8")).toBe("{}\n");
+    }
+    expect(wt(c, "sync").out).toContain("already up to date");
+    shared("[copy]\n.env\n");
+    for (const w of trees) rmSync(join(c, w, "alias.json"));
+    expect(wt(c, "sync").code).toBe(0);
+  });
+
+  test("a linked dir replaced by a nested [copy] entry is copied in the same run", () => {
+    mkdirSync(join(c, "cfg"));
+    writeFileSync(join(c, "cfg", "local.json"), "{\"a\":1}\n");
+    shared("[copy]\n.env\n[link]\ncfg\n");
+    expect(wt(c, "sync").code).toBe(0);
+    shared("[copy]\n.env\ncfg/local.json\n");
+    const r = wt(c, "sync");
+    expect(r.code).toBe(0);
+    for (const w of trees) {
+      expect(lstatSync(join(c, w, "cfg")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(c, w, "cfg", "local.json"), "utf8")).toBe("{\"a\":1}\n");
+    }
+    shared("[copy]\n.env\n");
+  });
+
   test(".shared rejects unknown sections and entries listed twice", () => {
     shared("[copies]\napp.yaml\n");
     expect(wt(c, "sync").err).toContain("unknown section [copies]");
@@ -366,11 +398,12 @@ describe("convert", () => {
 
   test("a failure rolls everything back to the original checkout", () => {
     const d2 = checkout("rb");
+    const config = readFileSync(join(d2, ".git", "config"), "utf8");
     writeFileSync(join(d2, "notes.md"), "untracked\n");
     const headBefore = git(d2, "rev-parse", "HEAD");
-    const f = spawnSync("bun", [TOOL, "convert", d2], { cwd: root, env: { ...env, GIT_WT_TEST_FAIL: "convert" }, encoding: "utf8" });
-    expect(f.status).toBe(1);
-    expect(f.stderr).toContain("Rolled back");
+    const f = convertWith("fail:late", d2);
+    expect(f.code).toBe(1);
+    expect(f.err).toContain("Rolled back");
     expect(lstatSync(join(d2, ".git")).isDirectory()).toBe(true);
     expect(existsSync(`${d2}.pre-wt`)).toBe(false);
     expect(existsSync(join(d2, ".bare"))).toBe(false);
@@ -379,6 +412,8 @@ describe("convert", () => {
     expect(git(d2, "status", "--porcelain", "--untracked-files=no")).toBe("");
     expect(git(d2, "worktree", "list").split("\n").length).toBe(1);
     expect(git(d2, "config", "core.bare")).toBe("false");
+    // No relative-worktrees extension or format bump left behind.
+    expect(readFileSync(join(d2, ".git", "config"), "utf8")).toBe(config);
   });
 
   test("cloned and converted containers survive being moved", () => {
@@ -426,8 +461,8 @@ describe("convert", () => {
 
     const d2 = checkout("cw-rb");
     git(d2, "config", "core.worktree", "..");
-    const f = spawnSync("bun", [TOOL, "convert", d2], { cwd: root, env: { ...env, GIT_WT_TEST_FAIL: "convert" }, encoding: "utf8" });
-    expect(f.stderr).toContain("Rolled back");
+    const f = convertWith("fail:late", d2);
+    expect(f.err).toContain("Rolled back");
     expect(git(d2, "config", "core.worktree")).toBe("..");
   });
 
@@ -463,8 +498,8 @@ describe("convert", () => {
     const d = sparseCheckout("sparse-rb");
     const cfg = readFileSync(join(d, ".git", "config.worktree"), "utf8");
     const pat = readFileSync(join(d, ".git", "info", "sparse-checkout"), "utf8");
-    const f = spawnSync("bun", [TOOL, "convert", d], { cwd: root, env: { ...env, GIT_WT_TEST_FAIL: "convert" }, encoding: "utf8" });
-    expect(f.stderr).toContain("Rolled back");
+    const f = convertWith("fail:late", d);
+    expect(f.err).toContain("Rolled back");
     expect(readFileSync(join(d, ".git", "config.worktree"), "utf8")).toBe(cfg);
     expect(readFileSync(join(d, ".git", "info", "sparse-checkout"), "utf8")).toBe(pat);
     expect(git(d, "sparse-checkout", "list")).toBe("only");
@@ -479,8 +514,8 @@ describe("convert", () => {
       writeFileSync(join(d, "feature-x", "keep.txt"), "real dir\n");
       writeFileSync(join(d, ".env"), "S=1\n");
       const head = git(d, "rev-parse", "HEAD");
-      const k = spawnSync("bun", [TOOL, "convert", d], { cwd: root, env: { ...env, GIT_WT_TEST_CRASH: at }, encoding: "utf8" });
-      expect(k.status).toBe(137);
+      const k = convertWith(`crash:${at}`, d);
+      expect(k.code).toBe(137);
       expect(existsSync(`${d}.git-wt-convert.json`)).toBe(true);
 
       const r = wt(root, "convert", d);
@@ -501,6 +536,20 @@ describe("convert", () => {
       expect(readFileSync(join(d, "feature-x", ".env"), "utf8")).toBe("S=1\n");
     });
   }
+
+  test("rollback of a journaled-but-not-done move keeps the original reflog", () => {
+    const d = checkout("crash-mid");
+    const reflog = readFileSync(join(d, ".git", "logs", "HEAD"), "utf8");
+    expect(convertWith("crash:late", d).code).toBe(137);
+    // Recreate the state of a kill after move() journaled logs/HEAD but before the rename:
+    // the original still in .bare, and worktree add's own one-line log at the destination.
+    const admin = join(d, "master", ".git"); // pointer file
+    const adminDir = join(d, "master", readFileSync(admin, "utf8").replace(/^gitdir: /, "").trim());
+    writeFileSync(join(d, ".bare", "logs", "HEAD"), reflog);
+    writeFileSync(join(adminDir, "logs", "HEAD"), "0000 1111 worktree-add-line\n");
+    expect(convertWith("", d).err).toContain("Rolled back");
+    expect(readFileSync(join(d, ".git", "logs", "HEAD"), "utf8")).toBe(reflog);
+  });
 
   test("a journal from a crash before anything moved is harmless", () => {
     const d = checkout("crash-none");
