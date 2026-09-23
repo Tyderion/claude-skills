@@ -125,6 +125,13 @@ describe("clone + add + sync", () => {
     expect(lstatSync(join(c, "master", "db.sqlite")).isSymbolicLink()).toBe(true);
   });
 
+  test("a symlinked route to the container still links correctly", () => {
+    symlinkSync(c, join(root, "via-link"));
+    expect(wt(join(root, "via-link"), "add", "vialink").code).toBe(0);
+    expect(readlinkSync(join(c, "vialink", ".env"))).toBe("../.env");
+    expect(wt(c, "sync").out).toContain("already up to date");
+  });
+
   test("sync removes links for paths dropped from .shared, never real files", () => {
     writeFileSync(join(c, ".shared"), ".env\n");
     const r = wt(c, "sync");
@@ -187,6 +194,33 @@ describe("convert", () => {
     expect(existsSync(join(d, ".bare", "index"))).toBe(false);
     expect(wt(d, "add", "master").code).toBe(0);
     expect(git(join(d, "master"), "rev-parse", "--abbrev-ref", "@{u}")).toBe("origin/master");
+  });
+
+  test("keeps skip-worktree and assume-unchanged bits", () => {
+    const d = checkout("bits");
+    git(d, "update-index", "--skip-worktree", "a.txt");
+    git(d, "update-index", "--assume-unchanged", ".gitignore");
+    expect(wt(root, "convert", d).code).toBe(0);
+    const flags = git(join(d, "master"), "ls-files", "-v");
+    expect(flags).toContain("S a.txt");
+    expect(flags).toContain("h .gitignore");
+  });
+
+  test("a failure rolls everything back to the original checkout", () => {
+    const d2 = checkout("rb");
+    writeFileSync(join(d2, "notes.md"), "untracked\n");
+    const headBefore = git(d2, "rev-parse", "HEAD");
+    const f = spawnSync("bun", [TOOL, "convert", d2], { cwd: root, env: { ...env, GIT_WT_TEST_FAIL: "convert" }, encoding: "utf8" });
+    expect(f.status).toBe(1);
+    expect(f.stderr).toContain("Rolled back");
+    expect(lstatSync(join(d2, ".git")).isDirectory()).toBe(true);
+    expect(existsSync(`${d2}.pre-wt`)).toBe(false);
+    expect(existsSync(join(d2, ".bare"))).toBe(false);
+    expect(readFileSync(join(d2, "notes.md"), "utf8")).toBe("untracked\n");
+    expect(git(d2, "rev-parse", "HEAD")).toBe(headBefore);
+    expect(git(d2, "status", "--porcelain", "--untracked-files=no")).toBe("");
+    expect(git(d2, "worktree", "list").split("\n").length).toBe(1);
+    expect(git(d2, "config", "core.bare")).toBe("false");
   });
 
   test("refuses a detached HEAD and an existing container", () => {

@@ -14,10 +14,10 @@
 import { spawnSync } from "node:child_process";
 import {
   existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync,
-  renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
+  renameSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 const USAGE = `git-wt — bare-repo worktree containers
 
@@ -28,9 +28,8 @@ const USAGE = `git-wt — bare-repo worktree containers
 
   git-wt convert [<path>]
       Turn a normal checkout (default: cwd) into a container in place. Refuses on
-      uncommitted tracked changes. Copies the tree into the new worktree, proves it
-      with diff -r and a stash comparison, grafts the old HEAD reflog, then deletes
-      the old tree.
+      uncommitted tracked changes. Only renames: the tree becomes the first worktree,
+      .git becomes .bare, the index and HEAD reflog carry over. Rolls back on failure.
 
   git-wt add <branch> [--from <start>] [-C <container>]
       New worktree in <container>/<branch with / -> ->. Uses the local branch, else
@@ -74,19 +73,13 @@ function lstatOrNull(p: string) {
 
 // ---------------------------------------------------------------- container
 
-function isContainer(dir: string): boolean {
-  const s = lstatOrNull(join(dir, ".bare"));
-  return !!s?.isDirectory() && existsSync(join(dir, ".bare", "HEAD"));
-}
-
+// git reports the common dir as a real path, so symlinked routes to the container resolve too.
 function findContainer(start: string): string {
-  let dir = resolve(start);
-  for (;;) {
-    if (isContainer(dir)) return dir;
-    const up = dirname(dir);
-    if (up === dir) fail(`no git-wt container (a directory holding .bare/) at or above ${start}`);
-    dir = up;
-  }
+  const dir = resolve(start);
+  if (!existsSync(dir)) fail(`${dir} does not exist`);
+  const r = gitTry(dir, "rev-parse", "--path-format=absolute", "--git-common-dir");
+  if (!r.ok || basename(r.out) !== ".bare") fail(`no git-wt container (a repository at <dir>/.bare) at or above ${dir}`);
+  return dirname(r.out);
 }
 
 function initContainerFiles(container: string) {
@@ -234,8 +227,6 @@ export function clone(url: string, opts: { dir?: string; base?: string; name?: s
   const base = expandHome(opts.base ?? process.env.GIT_WT_BASE ?? "~/coding");
   const container = resolve(opts.dir ? expandHome(opts.dir) : join(base, opts.name ?? repoName(url)));
   if (existsSync(container) && readdirSync(container).length) fail(`${container} already exists and is not empty`);
-  // `git clone` resolves a relative local path against cwd; `remote add` stores it verbatim.
-  if (existsSync(url)) url = resolve(url);
   const created = !existsSync(container);
   mkdirSync(container, { recursive: true });
   try {
@@ -250,21 +241,18 @@ export function clone(url: string, opts: { dir?: string; base?: string; name?: s
 
 function cloneInto(container: string, url: string): string {
   // Not `git clone --bare`: that copies every remote branch into refs/heads as local
-  // branches fetch never updates, and writes no fetch refspec. `remote add` writes the
-  // standard refspec, so branches land only as origin/* and stay current.
-  run("git", ["init", "--quiet", "--bare", join(container, ".bare")]);
-  initContainerFiles(container);
-  git(container, "remote", "add", "origin", url);
-  git(container, "fetch", "origin");
-  const head = gitTry(container, "remote", "set-head", "origin", "--auto");
-  const originHead = gitTry(container, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
-  if (!head.ok || !originHead.ok) {
-    log(`cloned into ${container}; the remote has no default branch yet, so no worktree was created`);
+  // branches fetch never updates, and writes no fetch refspec. A normal clone with its
+  // git dir placed at .bare gets the standard refspec, origin/*, and a tracking default
+  // branch; flipping core.bare makes every checkout a peer worktree.
+  run("git", ["clone", "--quiet", "--no-checkout", `--separate-git-dir=${join(container, ".bare")}`, url, container]);
+  git(join(container, ".bare"), "config", "core.bare", "true");
+  initContainerFiles(container); // replaces clone's absolute gitdir pointer
+  const def = defaultBranch(container);
+  if (!gitTry(container, "rev-parse", "--verify", "--quiet", `refs/heads/${def}`).ok) {
+    log(`cloned into ${container}; the remote has no commits yet, so no worktree was created`);
     return container;
   }
-  const def = originHead.out.replace(/^origin\//, "");
-  git(container, "symbolic-ref", "HEAD", `refs/heads/${def}`); // what `add --from` defaults to
-  git(container, "worktree", "add", "--track", "-b", def, flatten(def), `origin/${def}`);
+  git(container, "worktree", "add", flatten(def), def);
   reportSync(sync(container));
   log(`cloned ${url} into ${container}, worktree ${flatten(def)}/ on ${def}`);
   return container;
@@ -277,11 +265,10 @@ export function add(container: string, branch: string, from?: string): string {
   if (existsSync(folder)) fail(`${folder} already exists`);
   const has = (ref: string) => gitTry(container, "rev-parse", "--verify", "--quiet", ref).ok;
 
-  if (has(`refs/heads/${branch}`)) {
-    if (from) fail(`branch ${branch} already exists; --from only applies to new branches`);
+  // `worktree add <dir> <branch>` checks out a local branch, or creates one tracking
+  // origin/<branch> when only that exists. Only a genuinely new name needs -b.
+  if (!from && (has(`refs/heads/${branch}`) || has(`refs/remotes/origin/${branch}`))) {
     git(container, "worktree", "add", folder, branch);
-  } else if (has(`refs/remotes/origin/${branch}`) && !from) {
-    git(container, "worktree", "add", "--track", "-b", branch, folder, `origin/${branch}`);
   } else {
     const start = from ?? defaultBranch(container);
     git(container, "worktree", "add", "-b", branch, folder, start);
@@ -298,7 +285,6 @@ export function convert(path: string): string {
   const top = git(resolve(path), "rev-parse", "--show-toplevel");
   const gitDir = join(top, ".git");
   if (!lstatOrNull(gitDir)?.isDirectory()) fail(`${top}/.git is not a directory; convert needs a plain (non-worktree) checkout`);
-  if (isContainer(top)) fail(`${top} is already a git-wt container`);
   if (worktrees(top).length > 1) fail(`${top} already has linked worktrees; remove them first (git worktree list)`);
   if (existsSync(join(gitDir, "modules"))) fail(`${top} has submodules; their gitdirs would not survive the move`);
   for (const f of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG"]) {
@@ -313,49 +299,79 @@ export function convert(path: string): string {
 
   const old = `${top}.pre-wt`;
   if (existsSync(old)) fail(`${old} already exists; it is the staging name convert needs`);
-  const wt = join(top, flatten(branch));
-  const recover = () =>
-    `The original tree is in ${old} and its .git in ${top}/.bare. To undo: rm -rf ${top}/${flatten(branch)} ${top}/.git ${top}/.shared, mv ${top}/.bare ${old}/.git, git --git-dir=${old}/.git config core.bare false, rmdir ${top}, mv ${old} ${top}.`;
+  const flat = flatten(branch);
+  const wt = join(top, flat);
+  const bare = join(top, ".bare");
+  let adminDir = join(bare, "worktrees", flat); // git may suffix it; read back after add
 
+  // Every step is a rename, so nothing is copied or deleted and each step can be reversed.
+  // `rename(2)` can't move a directory into its own child, hence the .pre-wt staging name.
   renameSync(top, old);
   try {
     mkdirSync(top);
-    renameSync(join(old, ".git"), join(top, ".bare"));
-    git(join(top, ".bare"), "config", "core.bare", "true");
-    rmSync(join(top, ".bare", "index"), { force: true }); // the old index; the worktree gets its own
+    renameSync(join(old, ".git"), bare);
+    git(bare, "config", "core.bare", "true");
     initContainerFiles(top);
-    git(top, "worktree", "add", "--no-checkout", flatten(branch), branch);
+    git(top, "worktree", "add", "--no-checkout", flat, branch);
+    adminDir = readFileSync(join(wt, ".git"), "utf8").replace(/^gitdir: /, "").trim();
+    renameSync(join(wt, ".git"), join(old, ".git")); // the new worktree's pointer file
+    rmdirSync(wt);
+    renameSync(old, wt);
+    // The old index still matches the tree and keeps skip-worktree/assume-unchanged bits.
+    renameSync(join(bare, "index"), join(adminDir, "index"));
 
-    // Reflinks make this copy free on btrfs/xfs; elsewhere it is a real copy.
-    run("cp", ["-a", "--reflink=auto", `${old}/.`, `${wt}/`]);
-    git(wt, "reset", "--mixed", "--quiet");
-    if (git(wt, "status", "--porcelain", "--untracked-files=no")) fail("new worktree shows tracked changes after the copy");
+    if (process.env.GIT_WT_TEST_FAIL === "convert") fail("injected test failure");
+    const dirty = git(wt, "status", "--porcelain", "--untracked-files=no");
+    if (dirty) fail(`new worktree shows tracked changes:\n${dirty}`);
     if (git(wt, "rev-parse", "HEAD") !== head) fail("new worktree HEAD differs from the old one");
-
-    const d = run("diff", ["-r", "--no-dereference", old, wt], undefined, true);
-    const expected = `Only in ${wt}: .git`;
-    const extra = d.out.split("\n").filter((l) => l && l !== expected);
-    if (extra.length || d.err.trim()) fail(`diff -r found differences:\n${[...extra, d.err.trim()].filter(Boolean).join("\n")}`);
-
     const after = git(wt, "stash", "list", "--format=%H %gs");
     if (after !== stashes) fail(`stash list changed:\nbefore:\n${stashes}\nafter:\n${after}`);
-
-    // HEAD reflog is per-worktree: graft the old one in front (git counts HEAD@{n} from the end).
-    const bareLog = join(top, ".bare", "logs", "HEAD");
-    const wtLog = join(git(wt, "rev-parse", "--path-format=absolute", "--git-dir"), "logs", "HEAD");
-    if (existsSync(bareLog)) {
-      const combined = readFileSync(bareLog, "utf8") + (existsSync(wtLog) ? readFileSync(wtLog, "utf8") : "");
-      mkdirSync(dirname(wtLog), { recursive: true });
-      writeFileSync(wtLog, combined);
-      rmSync(bareLog);
-    }
   } catch (e) {
-    throw new Fail(`${(e as Error).message}\n\n${recover()}`);
+    throw new Fail(`${(e as Error).message}\n\n${rollback(top, old, wt, bare, adminDir)}`);
   }
 
-  rmSync(old, { recursive: true, force: true });
-  log(`converted ${top}: worktree ${flatten(branch)}/ on ${branch}; diff -r clean, ${stashes ? stashes.split("\n").length : 0} stash(es) intact, old tree removed`);
+  // HEAD reflog is per-worktree: graft the old one in front (git counts HEAD@{n} from the end).
+  const bareLog = join(bare, "logs", "HEAD");
+  const wtLog = join(adminDir, "logs", "HEAD");
+  if (existsSync(bareLog)) {
+    const combined = readFileSync(bareLog, "utf8") + (existsSync(wtLog) ? readFileSync(wtLog, "utf8") : "");
+    mkdirSync(dirname(wtLog), { recursive: true });
+    writeFileSync(wtLog, combined);
+    rmSync(bareLog);
+  }
+
+  const n = stashes ? stashes.split("\n").length : 0;
+  log(`converted ${top}: worktree ${flat}/ on ${branch}, ${n} stash(es) intact`);
+  if (process.cwd().startsWith(top)) log(`your shell's directory moved; run: cd ${JSON.stringify(wt)}`);
   return top;
+}
+
+/** Reverse whatever convert got through, newest step first. Returns a status line. */
+function rollback(top: string, old: string, wt: string, bare: string, adminDir: string): string {
+  const steps: [string, () => void][] = [
+    ["index back", () => { if (existsSync(join(adminDir, "index"))) renameSync(join(adminDir, "index"), join(bare, "index")); }],
+    ["tree back", () => { if (!existsSync(old) && existsSync(wt)) renameSync(wt, old); }],
+    ["worktree registration", () => {
+      if (lstatOrNull(join(old, ".git"))?.isFile()) rmSync(join(old, ".git"));
+      if (lstatOrNull(join(wt, ".git"))?.isFile()) rmSync(join(wt, ".git"));
+      if (existsSync(wt)) rmdirSync(wt); // empty by now; fails loudly if not
+      rmSync(adminDir, { recursive: true, force: true });
+    }],
+    ["repository back", () => {
+      if (existsSync(bare)) {
+        run("git", ["--git-dir", bare, "config", "core.bare", "false"]);
+        renameSync(bare, join(old, ".git"));
+      }
+    }],
+    ["container files", () => { for (const f of [".git", ".shared"]) rmSync(join(top, f), { force: true }); rmdirSync(top); }],
+    ["original name", () => renameSync(old, top)],
+  ];
+  for (const [name, step] of steps) {
+    try { step(); } catch (e) {
+      return `ROLLBACK STOPPED at "${name}": ${(e as Error).message}\nState: tree in ${JSON.stringify(existsSync(old) ? old : wt)}, repository in ${JSON.stringify(existsSync(bare) ? bare : join(old, ".git"))}. Nothing was deleted.`;
+    }
+  }
+  return `Rolled back: ${top} is the original checkout again.`;
 }
 
 // ---------------------------------------------------------------- cli
