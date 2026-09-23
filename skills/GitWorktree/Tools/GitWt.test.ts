@@ -125,6 +125,35 @@ describe("clone + add + sync", () => {
     expect(lstatSync(join(c, "master", "db.sqlite")).isSymbolicLink()).toBe(true);
   });
 
+  test("nested .shared entries are rejected before anything changes", () => {
+    const before = readFileSync(join(c, ".shared"), "utf8");
+    writeFileSync(join(c, ".shared"), before + "config\n");
+    const r = wt(c, "sync");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('"config/local.yaml" is inside "config"');
+    expect(lstatSync(join(c, "master", "config")).isSymbolicLink()).toBe(false);
+    writeFileSync(join(c, ".shared"), before);
+  });
+
+  test("an odd exclude block stops sync without touching the file", () => {
+    const file = join(c, ".bare", "info", "exclude");
+    const good = readFileSync(file, "utf8");
+    const bad = `/mine\n# >>> git-wt shared (managed by git-wt sync; edit .shared instead)\n/also-mine\n${good}`;
+    writeFileSync(file, bad);
+    const r = wt(c, "sync");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("more than one git-wt block");
+    expect(readFileSync(file, "utf8")).toBe(bad);
+    writeFileSync(file, good);
+  });
+
+  test("add prunes a deleted worktree so its branch is free again", () => {
+    expect(wt(c, "add", "gone").code).toBe(0);
+    rmSync(join(c, "gone"), { recursive: true });
+    expect(wt(c, "add", "gone").code).toBe(0);
+    expect(existsSync(join(c, "gone", "a.txt"))).toBe(true);
+  });
+
   test("a symlinked route to the container still links correctly", () => {
     symlinkSync(c, join(root, "via-link"));
     expect(wt(join(root, "via-link"), "add", "vialink").code).toBe(0);
@@ -235,6 +264,26 @@ describe("convert", () => {
       expect(git(to, "worktree", "list")).not.toContain("prunable");
       expect(wt(to, "add", "after-move").code).toBe(0);
     }
+  });
+
+  test("after converting a feature branch, new branches start from the default branch", () => {
+    const d = checkout("def");
+    git(d, "checkout", "-q", "feature/x");
+    git(d, "branch", "-q", "-D", "master"); // only origin/master remains
+    expect(wt(root, "convert", d).code).toBe(0);
+    const r = wt(d, "add", "newbranch");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("from origin/master");
+    expect(existsSync(join(d, "newbranch", "x.txt"))).toBe(false);
+    expect(git(join(d, "newbranch"), "rev-parse", "HEAD")).toBe(git(d, "rev-parse", "origin/master"));
+  });
+
+  test("convert prunes a stale linked worktree instead of carrying it over", () => {
+    const d = checkout("stale");
+    git(d, "worktree", "add", "-q", join(root, "stale-side"), "-b", "side");
+    rmSync(join(root, "stale-side"), { recursive: true });
+    expect(wt(root, "convert", d).code).toBe(0);
+    expect(wt(d, "add", "side").code).toBe(0);
   });
 
   test("refuses a detached HEAD and an existing container", () => {

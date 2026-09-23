@@ -133,6 +133,10 @@ export function readShared(container: string): string[] {
     if ([".git", ".bare", ".shared"].includes(p.split(sep)[0])) fail(`.shared: "${line}" collides with git-wt's own files`);
     if (!entries.includes(p)) entries.push(p);
   }
+  // A link for `a` would make `a/b` resolve through it into the root copy itself.
+  for (const a of entries) for (const b of entries) {
+    if (b.startsWith(a + sep)) fail(`.shared: "${b}" is inside "${a}", which is already shared; list only one of them`);
+  }
   return entries;
 }
 
@@ -144,11 +148,17 @@ function readManagedBlock(container: string): { before: string; entries: string[
   const file = excludeFile(container);
   const text = existsSync(file) ? readFileSync(file, "utf8") : "";
   const s = text.indexOf(BLOCK_START);
-  const e = text.indexOf(BLOCK_END);
-  if (s < 0 || e < s) return { before: text, entries: [], after: "" };
-  const body = text.slice(s + BLOCK_START.length, e);
-  const entries = body.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("/"))
-    .map((l) => l.slice(1).replace(/\\(.)/g, "$1"));
+  const e = s < 0 ? -1 : text.indexOf(BLOCK_END, s);
+  const odd = (why: string) => fail(`${file}: ${why}. Fix the git-wt block by hand (or delete both marker lines and everything between), then rerun`);
+  if (s < 0) {
+    if (text.includes(BLOCK_END)) odd("end marker without a start marker");
+    return { before: text, entries: [], after: "" };
+  }
+  if (e < 0) odd("start marker without an end marker");
+  if (text.indexOf(BLOCK_START, s + 1) >= 0 || text.indexOf(BLOCK_END, e + 1) >= 0) odd("more than one git-wt block");
+  const lines = text.slice(s + BLOCK_START.length, e).split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.some((l) => !l.startsWith("/"))) odd("unexpected lines inside the git-wt block");
+  const entries = lines.map((l) => l.slice(1).replace(/\\(.)/g, "$1"));
   return { before: text.slice(0, s), entries, after: text.slice(e + BLOCK_END.length).replace(/^\n/, "") };
 }
 
@@ -271,14 +281,17 @@ export function add(container: string, branch: string, from?: string): string {
   const folder = join(container, flatten(branch));
   if (existsSync(folder)) fail(`${folder} already exists`);
   const has = (ref: string) => gitTry(container, "rev-parse", "--verify", "--quiet", ref).ok;
+  git(container, "worktree", "prune");
 
   // `worktree add <dir> <branch>` checks out a local branch, or creates one tracking
   // origin/<branch> when only that exists. Only a genuinely new name needs -b.
   if (!from && (has(`refs/heads/${branch}`) || has(`refs/remotes/origin/${branch}`))) {
     git(container, "worktree", "add", folder, branch);
   } else {
-    const start = from ?? defaultBranch(container);
-    git(container, "worktree", "add", "-b", branch, folder, start);
+    const def = defaultBranch(container);
+    // After convert on a feature branch the default may exist only as origin/<def>.
+    const start = from ?? (has(`refs/heads/${def}`) ? def : `origin/${def}`);
+    git(container, "worktree", "add", "--no-track", "-b", branch, folder, start);
     log(`created new branch ${branch} from ${start}`);
   }
   reportSync(sync(container, [folder]));
@@ -292,6 +305,7 @@ export function convert(path: string): string {
   const top = git(resolve(path), "rev-parse", "--show-toplevel");
   const gitDir = join(top, ".git");
   if (!lstatOrNull(gitDir)?.isDirectory()) fail(`${top}/.git is not a directory; convert needs a plain (non-worktree) checkout`);
+  git(top, "worktree", "prune"); // stale entries for deleted folders would otherwise pin their branches
   if (worktrees(top).length > 1) fail(`${top} already has linked worktrees; remove them first (git worktree list)`);
   if (existsSync(join(gitDir, "modules"))) fail(`${top} has submodules; their gitdirs would not survive the move`);
   for (const f of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG"]) {
@@ -347,6 +361,12 @@ export function convert(path: string): string {
     writeFileSync(wtLog, combined);
     rmSync(bareLog);
   }
+
+  // .bare/HEAD still names the branch that was checked out; point it at the remote's default.
+  const originHead = gitTry(top, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
+  // No reflog: the bare HEAD log was just grafted into the worktree and should stay gone.
+  if (originHead.ok) git(top, "-c", "core.logAllRefUpdates=false", "symbolic-ref", "HEAD", `refs/heads/${originHead.out.replace(/^origin\//, "")}`);
+  else log(`note: origin/HEAD is unknown, so new branches will start from ${branch}; run git remote set-head origin --auto to fix`);
 
   const n = stashes ? stashes.split("\n").length : 0;
   log(`converted ${top}: worktree ${flat}/ on ${branch}, ${n} stash(es) intact`);
