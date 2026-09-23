@@ -58,9 +58,18 @@ describe("clone + add + sync", () => {
     expect(git(c, "config", "remote.origin.fetch")).toBe("+refs/heads/*:refs/remotes/origin/*");
     expect(existsSync(join(c, "master", "a.txt"))).toBe(true);
     expect(git(join(c, "master"), "rev-parse", "--abbrev-ref", "@{u}")).toBe("origin/master");
-    // Frozen non-default local branches are dropped; origin/* holds them.
+    // No local copies of other branches: they exist only as origin/*.
     expect(git(c, "for-each-ref", "--format=%(refname)", "refs/heads")).toBe("refs/heads/master");
     expect(git(c, "rev-parse", "--verify", "origin/feature/x")).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  test("clone resolves a relative local URL, and cleans up after a failed clone", () => {
+    git(root, "clone", "-q", "--bare", join(root, "proj.git"), join(root, "rel.git"));
+    expect(wt(root, "clone", "./rel.git", "--dir", join(root, "rel")).code).toBe(0);
+    expect(existsSync(join(root, "rel", "master", "a.txt"))).toBe(true);
+    const r = wt(root, "clone", "./nope.git", "--dir", join(root, "nope"));
+    expect(r.code).toBe(1);
+    expect(existsSync(join(root, "nope"))).toBe(false);
   });
 
   test("clone refuses a non-empty target", () => {

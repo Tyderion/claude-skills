@@ -48,6 +48,6 @@ User: "both worktrees should use the same .env"
 - **Shared paths are git-excluded automatically** via a managed block in `.bare/info/exclude`, which is shared by all worktrees. Edit `.shared`, never that block.
 - **`convert` refuses** uncommitted tracked changes, detached HEAD, in-progress merge/rebase, submodules, and repos that already have linked worktrees. Untracked and ignored files are fine and are carried over.
 - **`convert` deletes the old tree** only after `diff -r` shows nothing but the new `.git` pointer and the stash list matches exactly. On any failure it stops and prints the undo steps; the original sits at `<path>.pre-wt` with its `.git` at `<path>/.bare`.
-- **`clone` drops local copies of non-default branches.** A bare clone freezes every remote branch into `refs/heads`; after fixing the fetch refspec they live under `origin/*` and `add` creates tracking branches on demand.
+- **`clone` is `init --bare` + `remote add` + `fetch`, not `clone --bare`.** A bare clone copies every remote branch into `refs/heads` as local branches that fetch never updates, and writes no fetch refspec. This route leaves only `origin/*` refs, and `add` creates tracking branches on demand.
 - **`git wt --help` opens `man git-wt`** (git rewrites `--help` for every subcommand) and fails. Use `git wt -h` or `git-wt --help`.
 - **Run the tests after changing the tool:** `bun test ~/.claude/skills/GitWorktree/Tools/`.

@@ -23,7 +23,7 @@ const USAGE = `git-wt — bare-repo worktree containers
 
   git-wt clone <url> [--dir <path>] [--base <dir>] [--name <name>]
       Clone into <base>/<name> (base: $GIT_WT_BASE or ~/coding; name: from the URL),
-      with .bare/, the .git pointer, a working fetch refspec, and a first worktree
+      with .bare/, the .git pointer, every branch as origin/*, and a first worktree
       on the remote's default branch.
 
   git-wt convert [<path>]
@@ -234,27 +234,37 @@ export function clone(url: string, opts: { dir?: string; base?: string; name?: s
   const base = expandHome(opts.base ?? process.env.GIT_WT_BASE ?? "~/coding");
   const container = resolve(opts.dir ? expandHome(opts.dir) : join(base, opts.name ?? repoName(url)));
   if (existsSync(container) && readdirSync(container).length) fail(`${container} already exists and is not empty`);
+  // `git clone` resolves a relative local path against cwd; `remote add` stores it verbatim.
+  if (existsSync(url)) url = resolve(url);
+  const created = !existsSync(container);
   mkdirSync(container, { recursive: true });
-
-  run("git", ["clone", "--bare", url, join(container, ".bare")]);
-  initContainerFiles(container);
-  // A bare clone copies branches straight into refs/heads and sets no fetch refspec,
-  // so fetch would never populate origin/*. Fix the refspec, fetch, and drop the
-  // frozen local copies of every non-default branch (origin/* now holds them).
-  git(container, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
-  git(container, "fetch", "origin");
-  const def = defaultBranch(container);
-  const hasDefault = gitTry(container, "rev-parse", "--verify", "--quiet", `refs/heads/${def}`).ok;
-  for (const b of git(container, "for-each-ref", "--format=%(refname:short)", "refs/heads").split("\n").filter(Boolean)) {
-    if (b !== def) git(container, "branch", "-D", b);
+  try {
+    return cloneInto(container, url);
+  } catch (e) {
+    // Remove only what this call made; a pre-existing empty target dir stays.
+    const made = created ? [container] : [".bare", ".git", ".shared"].map((f) => join(container, f));
+    for (const p of made) rmSync(p, { recursive: true, force: true });
+    throw e;
   }
+}
 
-  if (!hasDefault) {
-    log(`cloned into ${container}; the remote has no commits on ${def}, so no worktree was created`);
+function cloneInto(container: string, url: string): string {
+  // Not `git clone --bare`: that copies every remote branch into refs/heads as local
+  // branches fetch never updates, and writes no fetch refspec. `remote add` writes the
+  // standard refspec, so branches land only as origin/* and stay current.
+  run("git", ["init", "--quiet", "--bare", join(container, ".bare")]);
+  initContainerFiles(container);
+  git(container, "remote", "add", "origin", url);
+  git(container, "fetch", "origin");
+  const head = gitTry(container, "remote", "set-head", "origin", "--auto");
+  const originHead = gitTry(container, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
+  if (!head.ok || !originHead.ok) {
+    log(`cloned into ${container}; the remote has no default branch yet, so no worktree was created`);
     return container;
   }
-  git(container, "branch", `--set-upstream-to=origin/${def}`, def);
-  git(container, "worktree", "add", flatten(def), def);
+  const def = originHead.out.replace(/^origin\//, "");
+  git(container, "symbolic-ref", "HEAD", `refs/heads/${def}`); // what `add --from` defaults to
+  git(container, "worktree", "add", "--track", "-b", def, flatten(def), `origin/${def}`);
   reportSync(sync(container));
   log(`cloned ${url} into ${container}, worktree ${flatten(def)}/ on ${def}`);
   return container;
