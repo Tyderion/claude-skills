@@ -318,7 +318,22 @@ export function add(container: string, branch: string, from?: string): string {
 
 // ---------------------------------------------------------------- convert
 
+const journalFor = (top: string) => `${top}.git-wt-convert.json`;
+
+/** A convert killed mid-way (SIGKILL, power loss) leaves a journal; roll it back first. */
+function resumeInterrupted(path: string): void {
+  const p = resolve(path);
+  for (const top of [p, p.replace(/\.pre-wt$/, ""), dirname(p)]) {
+    const journal = journalFor(top);
+    if (!existsSync(journal)) continue;
+    const result = rollback(JSON.parse(readFileSync(journal, "utf8")) as ConvertState);
+    if (!result.startsWith("ROLLBACK STOPPED")) rmSync(journal);
+    fail(`found an interrupted convert of ${top}. ${result}${result.startsWith("ROLLBACK STOPPED") ? `\nJournal kept at ${journal}.` : "\nRun convert again."}`);
+  }
+}
+
 export function convert(path: string): string {
+  resumeInterrupted(path);
   const top = git(resolve(path), "rev-parse", "--show-toplevel");
   const gitDir = join(top, ".git");
   if (!lstatOrNull(gitDir)?.isDirectory()) fail(`${top}/.git is not a directory; convert needs a plain (non-worktree) checkout`);
@@ -351,23 +366,37 @@ export function convert(path: string): string {
     wroteBareWorktreeConfig: false,
   };
   const { wt, bare } = x;
+  // Write-ahead: the journal records each step before it happens, so a hard kill at any
+  // point leaves enough for the next run to roll back. Rollback tolerates steps not taken.
+  const journal = journalFor(top);
+  const save = () => writeFileSync(journal, JSON.stringify(x));
   const move = (from: string, to: string) => {
     if (!existsSync(from)) return;
+    x.moved.push([from, to]);
+    save();
     mkdirSync(dirname(to), { recursive: true });
     renameSync(from, to);
-    x.moved.push([from, to]);
   };
+  // Ctrl-C would otherwise kill us between two renames. With a listener installed the
+  // signal no longer terminates; Bun delivers it to JS only after this synchronous run, so
+  // the listener stays for the life of the process. Ctrl-C still reaches the git child in
+  // the foreground group, so that step fails and the normal rollback runs.
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => {});
+  const crash = (at: string) => { if (process.env.GIT_WT_TEST_CRASH === at) process.exit(137); };
 
   // Every step is a rename, so nothing is copied or deleted and each step can be reversed.
   // `rename(2)` can't move a directory into its own child, hence the .pre-wt staging name.
+  save();
   renameSync(top, old);
   try {
+    crash("early");
     mkdirSync(top);
     renameSync(join(old, ".git"), bare);
     if (x.worktreeConfig) {
       move(join(bare, "config.worktree"), join(bare, "config.worktree.git-wt")); // the old main worktree's settings
-      git(bare, "config", "--worktree", "core.bare", "true");
       x.wroteBareWorktreeConfig = true;
+      save();
+      git(bare, "config", "--worktree", "core.bare", "true");
     } else {
       git(bare, "config", "core.bare", "true");
     }
@@ -376,6 +405,7 @@ export function convert(path: string): string {
     enableRelativePaths(top);
     git(top, "worktree", "add", "--no-checkout", flat, branch);
     x.adminDir = resolve(wt, readFileSync(join(wt, ".git"), "utf8").replace(/^gitdir: /, "").trim());
+    save();
     renameSync(join(wt, ".git"), join(old, ".git")); // the new worktree's pointer file
     rmdirSync(wt);
     renameSync(old, wt);
@@ -385,6 +415,7 @@ export function convert(path: string): string {
     move(join(bare, "config.worktree.git-wt"), join(x.adminDir, "config.worktree"));
     move(join(bare, "info", "sparse-checkout"), join(x.adminDir, "info", "sparse-checkout"));
 
+    crash("late");
     if (process.env.GIT_WT_TEST_FAIL === "convert") fail("injected test failure");
     const dirty = git(wt, "status", "--porcelain", "--untracked-files=no");
     if (dirty) fail(`new worktree shows tracked changes:\n${dirty}`);
@@ -392,8 +423,11 @@ export function convert(path: string): string {
     const after = git(wt, "stash", "list", "--format=%H %gs");
     if (after !== stashes) fail(`stash list changed:\nbefore:\n${stashes}\nafter:\n${after}`);
   } catch (e) {
-    throw new Fail(`${(e as Error).message}\n\n${rollback(x)}`);
+    const result = rollback(x);
+    if (!result.startsWith("ROLLBACK STOPPED")) rmSync(journal, { force: true });
+    throw new Fail(`${(e as Error).message}\n\n${result}`);
   }
+  rmSync(journal, { force: true });
   const { adminDir, coreWorktree } = x;
 
   // HEAD reflog is per-worktree: graft the old one in front (git counts HEAD@{n} from the end).
@@ -428,11 +462,13 @@ type ConvertState = {
 
 /** Reverse whatever convert got through, newest step first. Returns a status line. */
 function rollback({ top, old, wt, bare, adminDir, coreWorktree, worktreeConfig, moved, wroteBareWorktreeConfig }: ConvertState): string {
+  // Crashed before the first rename: nothing moved, and wt may name a real subdirectory.
+  if (!existsSync(old) && lstatOrNull(join(top, ".git"))?.isDirectory()) return `Nothing to roll back: ${top} was never touched.`;
   const steps: [string, () => void][] = [
     ["index back", () => { if (existsSync(join(adminDir, "index"))) renameSync(join(adminDir, "index"), join(bare, "index")); }],
     ["per-worktree settings back", () => {
-      if (wroteBareWorktreeConfig) rmSync(join(bare, "config.worktree"));
-      for (const [from, to] of [...moved].reverse()) renameSync(to, from);
+      if (wroteBareWorktreeConfig) rmSync(join(bare, "config.worktree"), { force: true });
+      for (const [from, to] of [...moved].reverse()) if (existsSync(to)) renameSync(to, from);
     }],
     ["tree back", () => { if (!existsSync(old) && existsSync(wt)) renameSync(wt, old); }],
     ["worktree registration", () => {
@@ -448,8 +484,12 @@ function rollback({ top, old, wt, bare, adminDir, coreWorktree, worktreeConfig, 
         renameSync(bare, join(old, ".git"));
       }
     }],
-    ["container files", () => { for (const f of [".git", ".shared"]) rmSync(join(top, f), { force: true }); rmdirSync(top); }],
-    ["original name", () => renameSync(old, top)],
+    ["container files", () => {
+      if (!existsSync(old)) return; // top is already the original again
+      for (const f of [".git", ".shared"]) rmSync(join(top, f), { force: true });
+      if (existsSync(top)) rmdirSync(top);
+    }],
+    ["original name", () => { if (existsSync(old)) renameSync(old, top); }],
   ];
   for (const [name, step] of steps) {
     try { step(); } catch (e) {

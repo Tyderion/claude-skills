@@ -377,6 +377,48 @@ describe("convert", () => {
     expect(git(d, "status", "--porcelain", "--untracked-files=no")).toBe("");
   });
 
+  for (const at of ["early", "late"]) {
+    test(`a convert killed ${at} is rolled back by the next run, then converts cleanly`, () => {
+      const d = checkout(`crash-${at}`);
+      git(d, "checkout", "-q", "feature/x"); // branch folder name must not be mistaken for a real dir
+      mkdirSync(join(d, "feature-x"));
+      writeFileSync(join(d, "feature-x", "keep.txt"), "real dir\n");
+      writeFileSync(join(d, ".env"), "S=1\n");
+      const head = git(d, "rev-parse", "HEAD");
+      const k = spawnSync("bun", [TOOL, "convert", d], { cwd: root, env: { ...env, GIT_WT_TEST_CRASH: at }, encoding: "utf8" });
+      expect(k.status).toBe(137);
+      expect(existsSync(`${d}.git-wt-convert.json`)).toBe(true);
+
+      const r = wt(root, "convert", d);
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("found an interrupted convert");
+      expect(r.err).toContain("Run convert again");
+      expect(existsSync(`${d}.git-wt-convert.json`)).toBe(false);
+      expect(existsSync(`${d}.pre-wt`)).toBe(false);
+      expect(lstatSync(join(d, ".git")).isDirectory()).toBe(true);
+      expect(git(d, "rev-parse", "HEAD")).toBe(head);
+      expect(git(d, "status", "--porcelain", "--untracked-files=no")).toBe("");
+      expect(readFileSync(join(d, "feature-x", "keep.txt"), "utf8")).toBe("real dir\n");
+      expect(readFileSync(join(d, ".env"), "utf8")).toBe("S=1\n");
+
+      // The tree's own feature-x/ dir ends up inside the feature-x worktree, untouched.
+      expect(wt(root, "convert", d).code).toBe(0);
+      expect(readFileSync(join(d, "feature-x", "feature-x", "keep.txt"), "utf8")).toBe("real dir\n");
+      expect(readFileSync(join(d, "feature-x", ".env"), "utf8")).toBe("S=1\n");
+    });
+  }
+
+  test("a journal from a crash before anything moved is harmless", () => {
+    const d = checkout("crash-none");
+    writeFileSync(`${d}.git-wt-convert.json`, JSON.stringify({
+      top: d, old: `${d}.pre-wt`, wt: join(d, "master"), bare: join(d, ".bare"), adminDir: join(d, ".bare", "worktrees", "master"),
+      worktreeConfig: false, moved: [], wroteBareWorktreeConfig: false,
+    }));
+    const r = wt(root, "convert", d);
+    expect(r.err).toContain("was never touched");
+    expect(wt(root, "convert", d).code).toBe(0);
+  });
+
   test("refuses a detached HEAD and an existing container", () => {
     const d = checkout("detached");
     git(d, "checkout", "-q", "--detach");
