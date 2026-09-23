@@ -214,6 +214,40 @@ describe("clone + add + sync", () => {
   });
 });
 
+describe("add with several remotes", () => {
+  let c: string;
+  beforeAll(() => {
+    c = join(root, "multi");
+    expect(wt(root, "clone", makeRemote("multi-origin"), "--dir", c).code).toBe(0);
+    const fork = makeRemote("multi-fork"); // also has master and feature/x
+    git(fork, "branch", "fork-only", "master");
+    git(c, "remote", "add", "fork", fork);
+    git(c, "fetch", "-q", "fork");
+  });
+
+  test("tracks a branch that exists only on a non-origin remote", () => {
+    const r = wt(c, "add", "fork-only");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("tracking fork/fork-only");
+    expect(git(join(c, "fork-only"), "rev-parse", "--abbrev-ref", "@{u}")).toBe("fork/fork-only");
+  });
+
+  test("a branch on several remotes needs --remote, which then picks it", () => {
+    const r = wt(c, "add", "feature/x");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("exists on fork, origin; pick one with --remote");
+    expect(existsSync(join(c, "feature-x"))).toBe(false);
+    expect(wt(c, "add", "feature/x", "--remote", "fork").code).toBe(0);
+    expect(git(join(c, "feature-x"), "rev-parse", "--abbrev-ref", "@{u}")).toBe("fork/feature/x");
+  });
+
+  test("--remote errors say where the branch actually is", () => {
+    expect(wt(c, "add", "fork-only2", "--remote", "origin").err).toContain("origin/fork-only2 does not exist (git fetch first?)");
+    expect(wt(c, "add", "nope", "--remote", "ghost").err).toContain("no remote named ghost");
+    expect(wt(c, "add", "x", "--remote", "fork", "--from", "master").err).toContain("pass only one");
+  });
+});
+
 describe("[copy] entries", () => {
   let c: string;
   const trees = ["master", "feature-x"];

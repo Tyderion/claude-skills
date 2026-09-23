@@ -32,10 +32,11 @@ const USAGE = `git-wt — bare-repo worktree containers
       uncommitted tracked changes. Only renames: the tree becomes the first worktree,
       .git becomes .bare, the index and HEAD reflog carry over. Rolls back on failure.
 
-  git-wt add <branch> [--from <start>] [-C <container>]
+  git-wt add <branch> [--from <start> | --remote <name>] [-C <container>]
       New worktree in <container>/<branch with / -> ->. Uses the local branch, else
-      tracks origin/<branch>, else creates <branch> from --from (default: the
-      default branch). Then links shared files into it.
+      tracks <remote>/<branch> from whichever remote has it (--remote picks one when
+      several do), else creates <branch> from --from (default: the default branch).
+      Then links shared files into it.
 
   git-wt sync [--reset <path>] [-C <container>]
       Apply .shared to every worktree. Bare lines and [link] entries become symlinks
@@ -351,7 +352,8 @@ function cloneInto(container: string, url: string): string {
 
 // ---------------------------------------------------------------- add
 
-export function add(container: string, branch: string, from?: string): string {
+export function add(container: string, branch: string, from?: string, remote?: string): string {
+  if (from && remote) fail("--from starts a new branch and --remote tracks an existing one; pass only one");
   const folder = join(container, flatten(branch));
   if (existsSync(folder)) {
     const owner = worktrees(container).find((w) => w.path === folder);
@@ -362,14 +364,27 @@ export function add(container: string, branch: string, from?: string): string {
   const has = (ref: string) => gitTry(container, "rev-parse", "--verify", "--quiet", ref).ok;
   git(container, "worktree", "prune");
 
-  // `worktree add <dir> <branch>` checks out a local branch, or creates one tracking
-  // origin/<branch> when only that exists. Only a genuinely new name needs -b.
-  if (!from && (has(`refs/heads/${branch}`) || has(`refs/remotes/origin/${branch}`))) {
+  // Which remotes carry a branch; a remote name can't be read off a ref, since it may contain '/'.
+  const remotes = git(container, "remote").split("\n").filter(Boolean);
+  const on = (b: string) => remotes.filter((r) => has(`refs/remotes/${r}/${b}`));
+
+  if (has(`refs/heads/${branch}`)) {
+    if (from || remote) fail(`branch ${branch} already exists locally; --from and --remote only apply when creating it`);
     git(container, "worktree", "add", folder, branch);
+  } else if (!from && (remote || on(branch).length)) {
+    const carriers = on(branch);
+    if (remote && !carriers.includes(remote)) {
+      fail(`${remote}/${branch} does not exist${carriers.length ? `; it is on ${carriers.join(", ")}` : remotes.includes(remote) ? " (git fetch first?)" : `: no remote named ${remote}`}`);
+    }
+    if (!remote && carriers.length > 1) fail(`${branch} exists on ${carriers.join(", ")}; pick one with --remote <name>`);
+    const r = remote ?? carriers[0];
+    git(container, "worktree", "add", "--track", "-b", branch, folder, `${r}/${branch}`);
+    log(`tracking ${r}/${branch}`);
   } else {
     const def = defaultBranch(container);
-    // After convert on a feature branch the default may exist only as origin/<def>.
-    const start = from ?? (has(`refs/heads/${def}`) ? def : `origin/${def}`);
+    // After convert on a feature branch the default may exist only on a remote (origin preferred).
+    const defRemotes = on(def).sort((a, b) => Number(b === "origin") - Number(a === "origin"));
+    const start = from ?? (has(`refs/heads/${def}`) ? def : defRemotes[0] ? `${defRemotes[0]}/${def}` : fail(`default branch ${def} not found locally or on any remote; pass --from <start>`));
     git(container, "worktree", "add", "--no-track", "-b", branch, folder, start);
     log(`created new branch ${branch} from ${start}`);
   }
@@ -581,7 +596,7 @@ const container = { type: "string", short: "C" } as const;
 const OPTIONS = {
   clone: { dir: str, base: str, name: str },
   convert: {},
-  add: { from: str, C: container },
+  add: { from: str, remote: str, C: container },
   sync: { reset: str, C: container },
 } as const;
 
@@ -606,8 +621,8 @@ function main(argv: string[]) {
       if (pos.length > 1) fail("usage: git-wt convert [<path>]");
       return void convert(pos[0] ?? process.cwd());
     case "add":
-      if (pos.length !== 1) fail("usage: git-wt add <branch> [--from <start>] [-C <container>]");
-      return void add(findContainer(flags.C ?? process.cwd()), pos[0], flags.from);
+      if (pos.length !== 1) fail("usage: git-wt add <branch> [--from <start> | --remote <name>] [-C <container>]");
+      return void add(findContainer(flags.C ?? process.cwd()), pos[0], flags.from, flags.remote);
     case "sync":
       if (pos.length) fail("usage: git-wt sync [--reset <path>] [-C <container>]");
       return reportSync(sync(findContainer(flags.C ?? process.cwd()), { reset: flags.reset }));

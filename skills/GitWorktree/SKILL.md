@@ -18,7 +18,7 @@ Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/GitWorktree/PREFERENCES.md` if
 |--------|---------|
 | Clone a URL into the layout | `git-wt clone <url> [--dir <path>] [--base <dir>] [--name <name>]` |
 | Convert an existing normal checkout | `git-wt convert [<path>]` |
-| New worktree for a branch | `git-wt add <branch> [--from <start>] [-C <container>]` |
+| New worktree for a branch | `git-wt add <branch> [--from <start> \| --remote <name>] [-C <container>]`: tracks the branch from whichever remote has it; `--remote` picks when several do |
 | Share one file across worktrees (edits visible everywhere) | move it to the container root, list it under `[link]` in `<container>/.shared`, then `git-wt sync` |
 | Give each worktree its own editable copy of a default | put the default in the container root, list it under `[copy]`, then `git-wt sync` |
 | Throw away a worktree's edits to a copied file | `git-wt sync --reset <path>` (replaces every diverged copy with the root default) |
