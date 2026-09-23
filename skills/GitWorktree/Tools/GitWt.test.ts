@@ -363,6 +363,16 @@ describe("[copy] entries", () => {
     shared("[copy]\n.env\n");
   });
 
+  test("a dangling symlink as a [copy] default is reported as missing, not a crash", () => {
+    symlinkSync("does-not-exist", join(c, "ghost.json"));
+    shared("[copy]\n.env\nghost.json\n");
+    const r = wt(c, "sync");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("ghost.json: not present");
+    shared("[copy]\n.env\n");
+    rmSync(join(c, "ghost.json"));
+  });
+
   test(".shared rejects unknown sections and entries listed twice", () => {
     shared("[copies]\napp.yaml\n");
     expect(wt(c, "sync").err).toContain("unknown section [copies]");
@@ -555,7 +565,7 @@ describe("convert", () => {
       const r = wt(root, "convert", d);
       expect(r.code).toBe(1);
       expect(r.err).toContain("found an interrupted convert");
-      expect(r.err).toContain("Run convert again");
+      expect(r.err).toContain("run convert again");
       expect(existsSync(`${d}.git-wt-convert.json`)).toBe(false);
       expect(existsSync(`${d}.pre-wt`)).toBe(false);
       expect(lstatSync(join(d, ".git")).isDirectory()).toBe(true);
@@ -588,11 +598,11 @@ describe("convert", () => {
   test("a journal from a crash before anything moved is harmless", () => {
     const d = checkout("crash-none");
     writeFileSync(`${d}.git-wt-convert.json`, JSON.stringify({
-      top: d, old: `${d}.pre-wt`, wt: join(d, "master"), bare: join(d, ".bare"), adminDir: join(d, ".bare", "worktrees", "master"),
-      worktreeConfig: false, moved: [], wroteBareWorktreeConfig: false,
+      top: d, old: `${d}.pre-wt`, wt: join(d, "master"), bare: join(d, ".bare"), adminDir: "",
+      moved: [], wroteBareWorktreeConfig: false, config: "", linked: [],
     }));
     const r = wt(root, "convert", d);
-    expect(r.err).toContain("was never touched");
+    expect(r.err).toContain("is the original checkout");
     expect(wt(root, "convert", d).code).toBe(0);
   });
 
@@ -645,6 +655,63 @@ describe("convert", () => {
     expect(r.code).toBe(1);
     expect(r.err).toContain("already taken");
     expect(lstatSync(join(d, ".git")).isDirectory()).toBe(true);
+  });
+
+  test("rollback never deletes an admin dir that belongs to an existing linked worktree", () => {
+    const d = checkout("adm");
+    const other = join(root, "adm-wts", "master"); // admin id "master" = the main worktree's folder name
+    git(d, "worktree", "add", "-q", other, "-b", "other");
+    writeFileSync(join(other, "staged.txt"), "s\n");
+    git(other, "add", "staged.txt");
+    expect(convertWith("fail:repo", d).err).toContain("Rolled back");
+    expect(git(other, "status", "--porcelain")).toBe("A  staged.txt");
+    expect(existsSync(join(d, ".git", "worktrees", "master"))).toBe(true);
+  });
+
+  test("a stopped relink is finished by the next convert instead of being forgotten", () => {
+    const d = checkout("relink");
+    const side = join(root, "relink.2");
+    git(d, "worktree", "add", "-q", side, "-b", "side");
+    expect(convertWith("crash:late", d).code).toBe(137);
+    const journal = readFileSync(`${d}.git-wt-convert.json`, "utf8");
+    expect(wt(root, "convert", d).err).toContain("Rolled back"); // full rollback
+    // Recreate "rollback stopped right before relinking": journal present, link still wrong.
+    writeFileSync(`${d}.git-wt-convert.json`, journal);
+    const id = readFileSync(join(side, ".git"), "utf8").trim().split("/").pop()!;
+    writeFileSync(join(d, ".git", "worktrees", id, "gitdir"), "/nowhere/.git\n");
+    const r = wt(root, "convert", d);
+    expect(r.err).toContain("is the original checkout");
+    expect(git(side, "rev-parse", "--abbrev-ref", "HEAD")).toBe("side");
+    expect(git(d, "worktree", "list")).not.toContain("prunable");
+  });
+
+  test("a linked worktree nested inside another linked worktree moves with it", () => {
+    const d = checkout("nest");
+    const outer = join(root, "nest-a");
+    git(d, "worktree", "add", "-q", outer, "-b", "a");
+    git(d, "worktree", "add", "-q", join(outer, "inner"), "-b", "inner");
+    const r = wt(root, "convert", d);
+    expect(r.code).toBe(0);
+    expect(git(join(d, "a"), "rev-parse", "--abbrev-ref", "HEAD")).toBe("a");
+    expect(git(join(d, "inner"), "rev-parse", "--abbrev-ref", "HEAD")).toBe("inner");
+    expect(git(d, "worktree", "list")).not.toContain("prunable");
+  });
+
+  test("a linked worktree on an unborn branch converts", () => {
+    const d = checkout("orph");
+    git(d, "worktree", "add", "-q", "--orphan", "-b", "orph", join(root, "orph.2"));
+    expect(wt(root, "convert", d).code).toBe(0);
+    expect(git(join(d, "orph"), "symbolic-ref", "HEAD")).toBe("refs/heads/orph");
+  });
+
+  test("rollback keeps a relative linked worktree link relative", () => {
+    const d = checkout("relwt");
+    const side = join(root, "relwt.2");
+    git(d, "-c", "worktree.useRelativePaths=true", "worktree", "add", "-q", side, "-b", "side");
+    const link = readFileSync(join(side, ".git"), "utf8");
+    expect(link).toStartWith("gitdir: ..");
+    expect(convertWith("fail:late", d).err).toContain("Rolled back");
+    expect(readFileSync(join(side, ".git"), "utf8")).toBe(link);
   });
 
   test("refuses a detached HEAD and an existing container", () => {

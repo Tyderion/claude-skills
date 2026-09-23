@@ -230,7 +230,7 @@ export function sync(container: string, opts: { only?: string[]; reset?: string 
   const pointsAt = (path: string, real: string) => resolve(dirname(path), readlinkSync(path)) === real;
 
   for (const entry of [...link, ...copy]) {
-    if (!lstatOrNull(join(container, entry))) warnings.push(`${entry}: not present in the container root yet, nothing linked or copied`);
+    if (!existsSync(join(container, entry))) warnings.push(`${entry}: not present in the container root yet, nothing linked or copied`);
   }
 
   for (const wt of trees) {
@@ -243,7 +243,7 @@ export function sync(container: string, opts: { only?: string[]; reset?: string 
     }
     for (const entry of link) {
       const real = join(container, entry);
-      if (!lstatOrNull(real)) continue;
+      if (!existsSync(real)) continue; // follows links: a dangling default counts as missing
       const path = join(wt.path, entry);
       const st = lstatOrNull(path);
       if (!st) actions.push({ kind: "link", path, target: relative(dirname(path), real) });
@@ -253,7 +253,7 @@ export function sync(container: string, opts: { only?: string[]; reset?: string 
     }
     for (const entry of copy) {
       const real = join(container, entry);
-      if (!lstatOrNull(real)) continue;
+      if (!existsSync(real)) continue; // follows links: a dangling default counts as missing
       const path = join(wt.path, entry);
       const st = lstatOrNull(path);
       // Seen through a link that is about to go (the entry, or a parent dir moved from [link]).
@@ -369,11 +369,11 @@ export function add(container: string, branch: string, from?: string, remote?: s
   const remotes = git(container, "remote").split("\n").filter(Boolean);
   const on = (b: string) => remotes.filter((r) => has(`refs/remotes/${r}/${b}`));
 
+  const carriers = on(branch);
   if (has(`refs/heads/${branch}`)) {
     if (from || remote) fail(`branch ${branch} already exists locally; --from and --remote only apply when creating it`);
     git(container, "worktree", "add", folder, branch);
-  } else if (!from && (remote || on(branch).length)) {
-    const carriers = on(branch);
+  } else if (!from && (remote || carriers.length)) {
     if (remote && !carriers.includes(remote)) {
       fail(`${remote}/${branch} does not exist${carriers.length ? `; it is on ${carriers.join(", ")}` : remotes.includes(remote) ? " (git fetch first?)" : `: no remote named ${remote}`}`);
     }
@@ -410,9 +410,7 @@ function resumeInterrupted(path: string): void {
     } catch (e) {
       fail(`found an interrupted convert of ${top}, but its journal ${journal} is unreadable (${(e as Error).message}). Restore by hand: the tree is ${top}.pre-wt or a folder inside ${top}, the repository ${top}/.bare or ${top}.pre-wt/.git.`);
     }
-    const result = rollback(state!);
-    if (!result.startsWith("ROLLBACK STOPPED")) rmSync(journal);
-    fail(`found an interrupted convert of ${top}. ${result}${result.startsWith("ROLLBACK STOPPED") ? `\nJournal kept at ${journal}.` : "\nRun convert again."}`);
+    fail(`found an interrupted convert of ${top}. ${rollback(state!, journal)}\nOnce it is rolled back, run convert again.`);
   }
 }
 
@@ -441,23 +439,34 @@ export function convert(path: string): string {
   const flat = flatten(branch);
   // Existing linked worktrees move into the container too, named like `add` would name them.
   const taken = new Set([flat, ".bare", ".git", ".shared"]);
-  const linked = others.map((w) => {
+  const within = (p: string, dir: string) => p.startsWith(dir + sep);
+  const host = others.find((w) => within(top, w.path));
+  if (host) fail(`${top} sits inside its own linked worktree ${host.path}; move one of them apart first`);
+  // Outermost first: a worktree nested in the main tree or in an earlier linked one travels
+  // with it, so its source is wherever its innermost moved ancestor ends up.
+  const movers: { orig: string; now: string }[] = [{ orig: top, now: join(top, flat) }];
+  const linked = [...others].sort((a, b) => a.path.length - b.path.length).map((w) => {
     const name = w.branch ? flatten(w.branch) : basename(w.path);
     if (taken.has(name)) fail(`linked worktree ${w.path} would become ${join(top, name)}, which is already taken; move or rename it first`);
     taken.add(name);
-    // One nested inside the main tree travels with it; it is picked up from its new place.
-    const inside = w.path.startsWith(top + sep);
-    return { orig: w.path, from: inside ? join(top, flat, relative(top, w.path)) : w.path, to: join(top, name), head: w.head ?? "" };
+    const anc = movers.filter((m) => within(w.path, m.orig)).sort((a, b) => b.orig.length - a.orig.length)[0];
+    const to = join(top, name);
+    movers.push({ orig: w.path, now: to });
+    const link = readFileSync(join(w.path, ".git"), "utf8").replace(/^gitdir: /, "").trim();
+    return {
+      orig: w.path, from: anc ? join(anc.now, relative(anc.orig, w.path)) : w.path, to,
+      head: w.head ?? "", branch: w.branch, relative: !isAbsolute(link),
+    };
   });
+  // Convert requires .git at the top level, so any core.worktree can only name this same
+  // tree: redundant here, and contradictory next to core.bare. Dropped (rollback restores config).
+  const coreWorktree = gitTry(top, "config", "--local", "--get", "core.worktree").out || undefined;
+  // Sparse checkout turns this on. Then per-worktree settings live in config.worktree,
+  // so core.bare must go there too, or every linked worktree would read it as bare.
+  const worktreeConfig = gitTry(top, "config", "--get", "--type=bool", "extensions.worktreeConfig").out === "true";
   const x: ConvertState = {
     top, old, wt: join(top, flat), bare: join(top, ".bare"),
-    adminDir: join(top, ".bare", "worktrees", flat), // git may suffix it; read back after add
-    // Convert requires .git at the top level, so any core.worktree can only name this same
-    // tree: redundant here, and contradictory next to core.bare. Dropped, restored on rollback.
-    coreWorktree: gitTry(top, "config", "--local", "--get", "core.worktree").out || undefined,
-    // Sparse checkout turns this on. Then per-worktree settings live in config.worktree,
-    // so core.bare must go there too, or every linked worktree would read it as bare.
-    worktreeConfig: gitTry(top, "config", "--get", "--type=bool", "extensions.worktreeConfig").out === "true",
+    adminDir: "", // set from git's own answer after `worktree add`; a guess could name another worktree's
     moved: [],
     wroteBareWorktreeConfig: false,
     // Rollback writes this back verbatim: core.bare, core.worktree, and the relative-paths
@@ -505,7 +514,7 @@ export function convert(path: string): string {
     inject("early");
     mkdirSync(top);
     renameSync(join(old, ".git"), bare);
-    if (x.worktreeConfig) {
+    if (worktreeConfig) {
       move(join(bare, "config.worktree"), join(bare, "config.worktree.git-wt")); // the old main worktree's settings
       x.wroteBareWorktreeConfig = true;
       save();
@@ -513,8 +522,9 @@ export function convert(path: string): string {
     } else {
       git(bare, "config", "core.bare", "true");
     }
-    if (x.coreWorktree !== undefined) git(bare, "config", "--unset", "core.worktree");
+    if (coreWorktree !== undefined) git(bare, "config", "--unset", "core.worktree");
     initContainerFiles(top);
+    inject("repo"); // .git is now .bare, the new worktree not yet registered
     git(top, "worktree", "add", "--no-checkout", flat, branch);
     x.adminDir = resolve(wt, readFileSync(join(wt, ".git"), "utf8").replace(/^gitdir: /, "").trim());
     save();
@@ -539,17 +549,18 @@ export function convert(path: string): string {
     if (dirty) fail(`new worktree shows tracked changes:\n${dirty}`);
     if (git(wt, "rev-parse", "HEAD") !== head) fail("new worktree HEAD differs from the old one");
     for (const l of x.linked) {
-      if (gitTry(l.to, "rev-parse", "HEAD").out !== l.head) fail(`linked worktree ${l.to} does not resolve to its old HEAD after repair`);
+      // A branch with no commits yet (orphan) has no HEAD commit; staying on the branch is the check.
+      const unborn = /^0+$/.test(l.head);
+      const ok = (l.branch === undefined || gitTry(l.to, "symbolic-ref", "HEAD").out === `refs/heads/${l.branch}`)
+        && (unborn || gitTry(l.to, "rev-parse", "HEAD").out === l.head);
+      if (!ok) fail(`linked worktree ${l.to} is not on its old HEAD after repair`);
     }
     const after = git(wt, "stash", "list", "--format=%H %gs");
     if (after !== stashes) fail(`stash list changed:\nbefore:\n${stashes}\nafter:\n${after}`);
   } catch (e) {
-    const result = rollback(x);
-    if (!result.startsWith("ROLLBACK STOPPED")) rmSync(journal, { force: true });
-    throw new Fail(`${(e as Error).message}\n\n${result}`);
+    throw new Fail(`${(e as Error).message}\n\n${rollback(x, journal)}`);
   }
   rmSync(journal, { force: true });
-  const { coreWorktree } = x;
 
   // .bare/HEAD still names the branch that was checked out; point it at the remote's default.
   const originHead = gitTry(top, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
@@ -567,17 +578,36 @@ export function convert(path: string): string {
 
 type ConvertState = {
   top: string; old: string; wt: string; bare: string; adminDir: string;
-  coreWorktree?: string; worktreeConfig: boolean;
   moved: [from: string, to: string][]; // per-worktree files relocated, in order
   wroteBareWorktreeConfig: boolean; // .bare/config.worktree is ours (holds only core.bare)
   config: string; // the original .git/config
-  linked: { orig: string; from: string; to: string; head: string }[]; // existing linked worktrees
+  // Existing linked worktrees. `relative`: whether their .git link was relative before.
+  linked: { orig: string; from: string; to: string; head: string; branch?: string; relative: boolean }[];
 };
 
-/** Reverse whatever convert got through, newest step first. Returns a status line. */
-function rollback({ top, old, wt, bare, adminDir, moved, wroteBareWorktreeConfig, config, linked = [] }: ConvertState): string {
-  // Crashed before the first rename: nothing moved, and wt may name a real subdirectory.
-  if (!existsSync(old) && lstatOrNull(join(top, ".git"))?.isDirectory()) return `Nothing to roll back: ${top} was never touched.`;
+/** Reverse whatever convert got through, newest step first. Deletes the journal once the
+ *  original is back, keeps it when a step stops. Returns a status line. */
+function rollback({ top, old, wt, bare, adminDir, moved, wroteBareWorktreeConfig, config, linked }: ConvertState, journal: string): string {
+  const done = (msg: string) => { rmSync(journal, { force: true }); return msg; };
+  const stopped = (name: string, e: unknown) => {
+    const tree = existsSync(old) ? old : lstatOrNull(join(top, ".git"))?.isDirectory() ? top : wt;
+    const repo = existsSync(bare) ? bare : existsSync(join(old, ".git")) ? join(old, ".git") : join(top, ".git");
+    return `ROLLBACK STOPPED at "${name}": ${(e as Error).message}\nState: tree in ${JSON.stringify(tree)}, repository in ${JSON.stringify(repo)}. Nothing was deleted. Journal kept at ${journal}.`;
+  };
+  // Point linked worktrees back at the restored repo, keeping each link's original form.
+  // Idempotent, so it also runs when an earlier rollback stopped right before it.
+  const relink = () => {
+    for (const rel of [true, false]) {
+      const paths = linked.filter((l) => l.relative === rel).map((l) => l.orig);
+      if (paths.length) run("git", ["-c", `worktree.useRelativePaths=${rel}`, "worktree", "repair", ...paths], top);
+    }
+  };
+  // The original is back in place (never touched, or a previous rollback got this far).
+  // A real subdirectory may share wt's name here, so nothing below may run.
+  if (!existsSync(old) && lstatOrNull(join(top, ".git"))?.isDirectory()) {
+    try { relink(); } catch (e) { return stopped("linked worktrees relinked", e); }
+    return done(`Nothing left to roll back: ${top} is the original checkout.`);
+  }
   const steps: [string, () => void][] = [
     ["linked worktrees back", () => {
       for (const l of [...linked].reverse()) if (existsSync(l.to) && !existsSync(l.from)) renameSync(l.to, l.from);
@@ -593,7 +623,7 @@ function rollback({ top, old, wt, bare, adminDir, moved, wroteBareWorktreeConfig
       if (lstatOrNull(join(old, ".git"))?.isFile()) rmSync(join(old, ".git"));
       if (lstatOrNull(join(wt, ".git"))?.isFile()) rmSync(join(wt, ".git"));
       if (existsSync(wt)) rmdirSync(wt); // empty by now; fails loudly if not
-      rmSync(adminDir, { recursive: true, force: true });
+      if (adminDir) rmSync(adminDir, { recursive: true, force: true }); // only ever the one git made for us
     }],
     ["repository back", () => {
       if (existsSync(bare)) {
@@ -607,16 +637,12 @@ function rollback({ top, old, wt, bare, adminDir, moved, wroteBareWorktreeConfig
       if (existsSync(top)) rmdirSync(top);
     }],
     ["original name", () => { if (existsSync(old)) renameSync(old, top); }],
-    ["linked worktrees relinked", () => {
-      if (linked.length) run("git", ["worktree", "repair", ...linked.map((l) => l.orig)], top);
-    }],
+    ["linked worktrees relinked", relink],
   ];
   for (const [name, step] of steps) {
-    try { step(); } catch (e) {
-      return `ROLLBACK STOPPED at "${name}": ${(e as Error).message}\nState: tree in ${JSON.stringify(existsSync(old) ? old : wt)}, repository in ${JSON.stringify(existsSync(bare) ? bare : join(old, ".git"))}. Nothing was deleted.`;
-    }
+    try { step(); } catch (e) { return stopped(name, e); }
   }
-  return `Rolled back: ${top} is the original checkout again.`;
+  return done(`Rolled back: ${top} is the original checkout again.`);
 }
 
 // ---------------------------------------------------------------- cli
