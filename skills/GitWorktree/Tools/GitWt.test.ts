@@ -302,6 +302,46 @@ describe("convert", () => {
     expect(git(d2, "config", "core.worktree")).toBe("..");
   });
 
+  function sparseCheckout(name: string) {
+    const dir = join(root, name);
+    git(root, "clone", "-q", "--sparse", `file://${makeRemote(`${name}-r`)}`, dir);
+    // makeRemote has only top-level files; add a directory so a cone pattern means something.
+    mkdirSync(join(dir, "only"));
+    writeFileSync(join(dir, "only", "in.txt"), "in\n");
+    git(dir, "sparse-checkout", "disable");
+    git(dir, "add", "only"); git(dir, "commit", "-qm", "dir");
+    git(dir, "sparse-checkout", "set", "only");
+    return dir;
+  }
+
+  test("converts a sparse checkout and keeps it sparse", () => {
+    const d = sparseCheckout("sparse");
+    expect(existsSync(join(d, "a.txt"))).toBe(true); // cone mode keeps top-level files
+    const r = wt(root, "convert", d);
+    expect(r.code).toBe(0);
+    const w = join(d, "master");
+    expect(git(w, "sparse-checkout", "list")).toBe("only");
+    expect(git(w, "status", "--porcelain", "--untracked-files=no")).toBe("");
+    expect(git(w, "rev-parse", "--is-bare-repository")).toBe("false");
+    expect(git(d, "rev-parse", "--is-bare-repository")).toBe("true");
+    expect(git(d, "config", "--get", "core.bare")).toBe("true"); // from .bare/config.worktree
+    // A new worktree is a normal (non-sparse) checkout of its own.
+    expect(wt(d, "add", "feature/x").code).toBe(0);
+    expect(git(join(d, "feature-x"), "rev-parse", "--is-bare-repository")).toBe("false");
+  });
+
+  test("a failed sparse convert restores its settings exactly", () => {
+    const d = sparseCheckout("sparse-rb");
+    const cfg = readFileSync(join(d, ".git", "config.worktree"), "utf8");
+    const pat = readFileSync(join(d, ".git", "info", "sparse-checkout"), "utf8");
+    const f = spawnSync("bun", [TOOL, "convert", d], { cwd: root, env: { ...env, GIT_WT_TEST_FAIL: "convert" }, encoding: "utf8" });
+    expect(f.stderr).toContain("Rolled back");
+    expect(readFileSync(join(d, ".git", "config.worktree"), "utf8")).toBe(cfg);
+    expect(readFileSync(join(d, ".git", "info", "sparse-checkout"), "utf8")).toBe(pat);
+    expect(git(d, "sparse-checkout", "list")).toBe("only");
+    expect(git(d, "status", "--porcelain", "--untracked-files=no")).toBe("");
+  });
+
   test("refuses a detached HEAD and an existing container", () => {
     const d = checkout("detached");
     git(d, "checkout", "-q", "--detach");

@@ -321,31 +321,52 @@ export function convert(path: string): string {
   const old = `${top}.pre-wt`;
   if (existsSync(old)) fail(`${old} already exists; it is the staging name convert needs`);
   const flat = flatten(branch);
-  const wt = join(top, flat);
-  const bare = join(top, ".bare");
-  let adminDir = join(bare, "worktrees", flat); // git may suffix it; read back after add
+  const x: ConvertState = {
+    top, old, wt: join(top, flat), bare: join(top, ".bare"),
+    adminDir: join(top, ".bare", "worktrees", flat), // git may suffix it; read back after add
+    // Convert requires .git at the top level, so any core.worktree can only name this same
+    // tree: redundant here, and contradictory next to core.bare. Dropped, restored on rollback.
+    coreWorktree: gitTry(top, "config", "--local", "--get", "core.worktree").out || undefined,
+    // Sparse checkout turns this on. Then per-worktree settings live in config.worktree,
+    // so core.bare must go there too, or every linked worktree would read it as bare.
+    worktreeConfig: gitTry(top, "config", "--get", "--type=bool", "extensions.worktreeConfig").out === "true",
+    moved: [],
+    wroteBareWorktreeConfig: false,
+  };
+  const { wt, bare } = x;
+  const move = (from: string, to: string) => {
+    if (!existsSync(from)) return;
+    mkdirSync(dirname(to), { recursive: true });
+    renameSync(from, to);
+    x.moved.push([from, to]);
+  };
 
   // Every step is a rename, so nothing is copied or deleted and each step can be reversed.
   // `rename(2)` can't move a directory into its own child, hence the .pre-wt staging name.
-  // Convert requires .git at the top level, so any core.worktree can only name this same
-  // tree: redundant here, and contradictory next to core.bare. Dropped, restored on rollback.
-  const coreWorktree = gitTry(top, "config", "--local", "--get", "core.worktree");
-
   renameSync(top, old);
   try {
     mkdirSync(top);
     renameSync(join(old, ".git"), bare);
-    git(bare, "config", "core.bare", "true");
-    if (coreWorktree.ok) git(bare, "config", "--unset", "core.worktree");
+    if (x.worktreeConfig) {
+      move(join(bare, "config.worktree"), join(bare, "config.worktree.git-wt")); // the old main worktree's settings
+      git(bare, "config", "--worktree", "core.bare", "true");
+      x.wroteBareWorktreeConfig = true;
+    } else {
+      git(bare, "config", "core.bare", "true");
+    }
+    if (x.coreWorktree !== undefined) git(bare, "config", "--unset", "core.worktree");
     initContainerFiles(top);
     enableRelativePaths(top);
     git(top, "worktree", "add", "--no-checkout", flat, branch);
-    adminDir = resolve(wt, readFileSync(join(wt, ".git"), "utf8").replace(/^gitdir: /, "").trim());
+    x.adminDir = resolve(wt, readFileSync(join(wt, ".git"), "utf8").replace(/^gitdir: /, "").trim());
     renameSync(join(wt, ".git"), join(old, ".git")); // the new worktree's pointer file
     rmdirSync(wt);
     renameSync(old, wt);
     // The old index still matches the tree and keeps skip-worktree/assume-unchanged bits.
-    renameSync(join(bare, "index"), join(adminDir, "index"));
+    renameSync(join(bare, "index"), join(x.adminDir, "index"));
+    // The old main worktree's own settings and sparse patterns now belong to this worktree.
+    move(join(bare, "config.worktree.git-wt"), join(x.adminDir, "config.worktree"));
+    move(join(bare, "info", "sparse-checkout"), join(x.adminDir, "info", "sparse-checkout"));
 
     if (process.env.GIT_WT_TEST_FAIL === "convert") fail("injected test failure");
     const dirty = git(wt, "status", "--porcelain", "--untracked-files=no");
@@ -354,8 +375,9 @@ export function convert(path: string): string {
     const after = git(wt, "stash", "list", "--format=%H %gs");
     if (after !== stashes) fail(`stash list changed:\nbefore:\n${stashes}\nafter:\n${after}`);
   } catch (e) {
-    throw new Fail(`${(e as Error).message}\n\n${rollback(top, old, wt, bare, adminDir, coreWorktree.ok ? coreWorktree.out : undefined)}`);
+    throw new Fail(`${(e as Error).message}\n\n${rollback(x)}`);
   }
+  const { adminDir, coreWorktree } = x;
 
   // HEAD reflog is per-worktree: graft the old one in front (git counts HEAD@{n} from the end).
   const bareLog = join(bare, "logs", "HEAD");
@@ -373,17 +395,28 @@ export function convert(path: string): string {
   if (originHead.ok) git(top, "-c", "core.logAllRefUpdates=false", "symbolic-ref", "HEAD", `refs/heads/${originHead.out.replace(/^origin\//, "")}`);
   else log(`note: origin/HEAD is unknown, so new branches will start from ${branch}; run git remote set-head origin --auto to fix`);
 
-  if (coreWorktree.ok) log(`removed core.worktree=${coreWorktree.out} (redundant, and it conflicts with core.bare)`);
+  if (coreWorktree !== undefined) log(`removed core.worktree=${coreWorktree} (redundant, and it conflicts with core.bare)`);
   const n = stashes ? stashes.split("\n").length : 0;
   log(`converted ${top}: worktree ${flat}/ on ${branch}, ${n} stash(es) intact`);
   if (process.cwd().startsWith(top)) log(`your shell's directory moved; run: cd ${JSON.stringify(wt)}`);
   return top;
 }
 
+type ConvertState = {
+  top: string; old: string; wt: string; bare: string; adminDir: string;
+  coreWorktree?: string; worktreeConfig: boolean;
+  moved: [from: string, to: string][]; // per-worktree files relocated, in order
+  wroteBareWorktreeConfig: boolean; // .bare/config.worktree is ours (holds only core.bare)
+};
+
 /** Reverse whatever convert got through, newest step first. Returns a status line. */
-function rollback(top: string, old: string, wt: string, bare: string, adminDir: string, coreWorktree?: string): string {
+function rollback({ top, old, wt, bare, adminDir, coreWorktree, worktreeConfig, moved, wroteBareWorktreeConfig }: ConvertState): string {
   const steps: [string, () => void][] = [
     ["index back", () => { if (existsSync(join(adminDir, "index"))) renameSync(join(adminDir, "index"), join(bare, "index")); }],
+    ["per-worktree settings back", () => {
+      if (wroteBareWorktreeConfig) rmSync(join(bare, "config.worktree"));
+      for (const [from, to] of [...moved].reverse()) renameSync(to, from);
+    }],
     ["tree back", () => { if (!existsSync(old) && existsSync(wt)) renameSync(wt, old); }],
     ["worktree registration", () => {
       if (lstatOrNull(join(old, ".git"))?.isFile()) rmSync(join(old, ".git"));
@@ -393,7 +426,7 @@ function rollback(top: string, old: string, wt: string, bare: string, adminDir: 
     }],
     ["repository back", () => {
       if (existsSync(bare)) {
-        run("git", ["--git-dir", bare, "config", "core.bare", "false"]);
+        if (!worktreeConfig) run("git", ["--git-dir", bare, "config", "core.bare", "false"]);
         if (coreWorktree !== undefined) run("git", ["--git-dir", bare, "config", "core.worktree", coreWorktree]);
         renameSync(bare, join(old, ".git"));
       }
