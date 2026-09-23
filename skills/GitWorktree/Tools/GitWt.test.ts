@@ -596,6 +596,57 @@ describe("convert", () => {
     expect(wt(root, "convert", d).code).toBe(0);
   });
 
+  test("takes existing linked worktrees into the container, dirty state and all", () => {
+    const d = checkout("lw");
+    const side = join(root, "lw.2");
+    git(d, "worktree", "add", "-q", side, "-b", "team/side");
+    writeFileSync(join(side, "a.txt"), "side edit\n"); // uncommitted, must survive
+    writeFileSync(join(side, "notes.md"), "untracked\n");
+    git(d, "worktree", "add", "-q", join(d, "nested", "inner"), "-b", "inner");
+    const heads = { side: git(side, "rev-parse", "HEAD"), inner: git(join(d, "nested", "inner"), "rev-parse", "HEAD") };
+
+    const r = wt(root, "convert", d);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`moved linked worktree ${side} -> ${join(d, "team-side")}`);
+    expect(existsSync(side)).toBe(false);
+    const list = git(d, "worktree", "list");
+    for (const name of ["master", "team-side", "inner"]) expect(list).toContain(join(d, name));
+    expect(list).not.toContain("prunable");
+    expect(git(join(d, "team-side"), "rev-parse", "HEAD")).toBe(heads.side);
+    expect(git(join(d, "inner"), "rev-parse", "HEAD")).toBe(heads.inner);
+    expect(git(join(d, "team-side"), "status", "--porcelain").split("\n")).toContain("M a.txt"); // helper trims the leading space
+    expect(readFileSync(join(d, "team-side", "notes.md"), "utf8")).toBe("untracked\n");
+    expect(readFileSync(join(d, "team-side", ".git"), "utf8")).toStartWith("gitdir: ../.bare/worktrees/");
+    expect(existsSync(join(d, "master", "nested", "inner"))).toBe(false);
+  });
+
+  test("a failed convert puts linked worktrees back where they were, still working", () => {
+    const d = checkout("lw-rb");
+    const side = join(root, "lw-rb.2");
+    git(d, "worktree", "add", "-q", side, "-b", "side");
+    git(d, "worktree", "add", "-q", join(d, "nested", "inner"), "-b", "inner");
+    const f = convertWith("fail:late", d);
+    expect(f.err).toContain("Rolled back");
+    expect(git(side, "rev-parse", "--abbrev-ref", "HEAD")).toBe("side");
+    expect(git(join(d, "nested", "inner"), "rev-parse", "--abbrev-ref", "HEAD")).toBe("inner");
+    expect(git(d, "worktree", "list")).not.toContain("prunable");
+    expect(lstatSync(join(d, ".git")).isDirectory()).toBe(true);
+  });
+
+  test("refuses locked linked worktrees and folder-name collisions", () => {
+    const d = checkout("lw-bad");
+    git(d, "worktree", "add", "-q", join(root, "lw-bad.2"), "-b", "x");
+    git(d, "worktree", "lock", join(root, "lw-bad.2"));
+    expect(wt(root, "convert", d).err).toContain("locked");
+    git(d, "worktree", "unlock", join(root, "lw-bad.2"));
+    git(d, "worktree", "add", "-q", join(root, "lw-bad.3"), "-b", "mas/ter"); // flattens to mas-ter
+    git(d, "checkout", "-q", "-b", "mas-ter");
+    const r = wt(root, "convert", d);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("already taken");
+    expect(lstatSync(join(d, ".git")).isDirectory()).toBe(true);
+  });
+
   test("refuses a detached HEAD and an existing container", () => {
     const d = checkout("detached");
     git(d, "checkout", "-q", "--detach");

@@ -110,7 +110,7 @@ function initContainerFiles(container: string) {
   }
 }
 
-type Worktree = { path: string; branch?: string };
+type Worktree = { path: string; branch?: string; head?: string; locked: boolean };
 
 function worktrees(container: string): Worktree[] {
   const out = git(container, "worktree", "list", "--porcelain");
@@ -120,7 +120,8 @@ function worktrees(container: string): Worktree[] {
     const path = lines.find((l) => l.startsWith("worktree "))?.slice(9);
     if (!path || lines.includes("bare") || lines.some((l) => l.startsWith("prunable"))) continue;
     const branch = lines.find((l) => l.startsWith("branch "))?.slice(7).replace(/^refs\/heads\//, "");
-    list.push({ path, branch });
+    const head = lines.find((l) => l.startsWith("HEAD "))?.slice(5);
+    list.push({ path, branch, head, locked: lines.some((l) => l === "locked" || l.startsWith("locked ")) });
   }
   return list;
 }
@@ -421,7 +422,9 @@ export function convert(path: string): string {
   const gitDir = join(top, ".git");
   if (!lstatOrNull(gitDir)?.isDirectory()) fail(`${top}/.git is not a directory; convert needs a plain (non-worktree) checkout`);
   git(top, "worktree", "prune"); // stale entries for deleted folders would otherwise pin their branches
-  if (worktrees(top).length > 1) fail(`${top} already has linked worktrees; remove them first (git worktree list)`);
+  const others = worktrees(top).filter((w) => w.path !== top);
+  const locked = others.filter((w) => w.locked).map((w) => w.path);
+  if (locked.length) fail(`linked worktrees are locked; unlock them first (git worktree unlock): ${locked.join(", ")}`);
   if (existsSync(join(gitDir, "modules"))) fail(`${top} has submodules; their gitdirs would not survive the move`);
   for (const f of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG"]) {
     if (existsSync(join(gitDir, f))) fail(`an operation is in progress (${f}); finish or abort it first`);
@@ -436,6 +439,16 @@ export function convert(path: string): string {
   const old = `${top}.pre-wt`;
   if (existsSync(old)) fail(`${old} already exists; it is the staging name convert needs`);
   const flat = flatten(branch);
+  // Existing linked worktrees move into the container too, named like `add` would name them.
+  const taken = new Set([flat, ".bare", ".git", ".shared"]);
+  const linked = others.map((w) => {
+    const name = w.branch ? flatten(w.branch) : basename(w.path);
+    if (taken.has(name)) fail(`linked worktree ${w.path} would become ${join(top, name)}, which is already taken; move or rename it first`);
+    taken.add(name);
+    // One nested inside the main tree travels with it; it is picked up from its new place.
+    const inside = w.path.startsWith(top + sep);
+    return { orig: w.path, from: inside ? join(top, flat, relative(top, w.path)) : w.path, to: join(top, name), head: w.head ?? "" };
+  });
   const x: ConvertState = {
     top, old, wt: join(top, flat), bare: join(top, ".bare"),
     adminDir: join(top, ".bare", "worktrees", flat), // git may suffix it; read back after add
@@ -450,6 +463,7 @@ export function convert(path: string): string {
     // Rollback writes this back verbatim: core.bare, core.worktree, and the relative-paths
     // extension (which older git can't read) all come off together.
     config: readFileSync(join(gitDir, "config"), "utf8"),
+    linked,
   };
   const { wt, bare } = x;
   // Write-ahead: the journal records each step before it happens, so a hard kill at any
@@ -514,11 +528,19 @@ export function convert(path: string): string {
     move(join(bare, "info", "sparse-checkout"), join(x.adminDir, "info", "sparse-checkout"));
     // HEAD reflog is per-worktree; the old history replaces the one line `worktree add` wrote.
     move(join(bare, "logs", "HEAD"), join(x.adminDir, "logs", "HEAD"));
+    // Linked worktrees: rename into the container, then let git fix both halves of the link.
+    for (const l of x.linked) {
+      renameSync(l.from, l.to);
+      git(top, "worktree", "repair", l.to);
+    }
 
     inject("late");
     const dirty = git(wt, "status", "--porcelain", "--untracked-files=no");
     if (dirty) fail(`new worktree shows tracked changes:\n${dirty}`);
     if (git(wt, "rev-parse", "HEAD") !== head) fail("new worktree HEAD differs from the old one");
+    for (const l of x.linked) {
+      if (gitTry(l.to, "rev-parse", "HEAD").out !== l.head) fail(`linked worktree ${l.to} does not resolve to its old HEAD after repair`);
+    }
     const after = git(wt, "stash", "list", "--format=%H %gs");
     if (after !== stashes) fail(`stash list changed:\nbefore:\n${stashes}\nafter:\n${after}`);
   } catch (e) {
@@ -536,6 +558,7 @@ export function convert(path: string): string {
   else log(`note: origin/HEAD is unknown, so new branches will start from ${branch}; run git remote set-head origin --auto to fix`);
 
   if (coreWorktree !== undefined) log(`removed core.worktree=${coreWorktree} (redundant, and it conflicts with core.bare)`);
+  for (const l of x.linked) log(`moved linked worktree ${l.orig} -> ${l.to}`);
   const n = stashes ? stashes.split("\n").length : 0;
   log(`converted ${top}: worktree ${flat}/ on ${branch}, ${n} stash(es) intact`);
   if (process.cwd().startsWith(top)) log(`your shell's directory moved; run: cd ${JSON.stringify(wt)}`);
@@ -548,13 +571,17 @@ type ConvertState = {
   moved: [from: string, to: string][]; // per-worktree files relocated, in order
   wroteBareWorktreeConfig: boolean; // .bare/config.worktree is ours (holds only core.bare)
   config: string; // the original .git/config
+  linked: { orig: string; from: string; to: string; head: string }[]; // existing linked worktrees
 };
 
 /** Reverse whatever convert got through, newest step first. Returns a status line. */
-function rollback({ top, old, wt, bare, adminDir, moved, wroteBareWorktreeConfig, config }: ConvertState): string {
+function rollback({ top, old, wt, bare, adminDir, moved, wroteBareWorktreeConfig, config, linked = [] }: ConvertState): string {
   // Crashed before the first rename: nothing moved, and wt may name a real subdirectory.
   if (!existsSync(old) && lstatOrNull(join(top, ".git"))?.isDirectory()) return `Nothing to roll back: ${top} was never touched.`;
   const steps: [string, () => void][] = [
+    ["linked worktrees back", () => {
+      for (const l of [...linked].reverse()) if (existsSync(l.to) && !existsSync(l.from)) renameSync(l.to, l.from);
+    }],
     ["per-worktree settings back", () => {
       if (wroteBareWorktreeConfig) rmSync(join(bare, "config.worktree"), { force: true });
       // `to` can pre-exist (worktree add writes its own logs/HEAD), so only a missing `from`
@@ -580,6 +607,9 @@ function rollback({ top, old, wt, bare, adminDir, moved, wroteBareWorktreeConfig
       if (existsSync(top)) rmdirSync(top);
     }],
     ["original name", () => { if (existsSync(old)) renameSync(old, top); }],
+    ["linked worktrees relinked", () => {
+      if (linked.length) run("git", ["worktree", "repair", ...linked.map((l) => l.orig)], top);
+    }],
   ];
   for (const [name, step] of steps) {
     try { step(); } catch (e) {
