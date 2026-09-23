@@ -286,6 +286,22 @@ describe("convert", () => {
     expect(wt(d, "add", "side").code).toBe(0);
   });
 
+  test("drops a redundant core.worktree, and restores it on rollback", () => {
+    const d = checkout("cw");
+    git(d, "config", "core.worktree", "..");
+    const r = wt(root, "convert", d);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("removed core.worktree=..");
+    expect(sh("git", ["config", "--get", "core.worktree"], d).code).toBe(1);
+    expect(sh("git", ["worktree", "list"], d).err).toBe(""); // no core.bare/core.worktree warning
+
+    const d2 = checkout("cw-rb");
+    git(d2, "config", "core.worktree", "..");
+    const f = spawnSync("bun", [TOOL, "convert", d2], { cwd: root, env: { ...env, GIT_WT_TEST_FAIL: "convert" }, encoding: "utf8" });
+    expect(f.stderr).toContain("Rolled back");
+    expect(git(d2, "config", "core.worktree")).toBe("..");
+  });
+
   test("refuses a detached HEAD and an existing container", () => {
     const d = checkout("detached");
     git(d, "checkout", "-q", "--detach");

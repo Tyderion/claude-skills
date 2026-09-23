@@ -327,11 +327,16 @@ export function convert(path: string): string {
 
   // Every step is a rename, so nothing is copied or deleted and each step can be reversed.
   // `rename(2)` can't move a directory into its own child, hence the .pre-wt staging name.
+  // Convert requires .git at the top level, so any core.worktree can only name this same
+  // tree: redundant here, and contradictory next to core.bare. Dropped, restored on rollback.
+  const coreWorktree = gitTry(top, "config", "--local", "--get", "core.worktree");
+
   renameSync(top, old);
   try {
     mkdirSync(top);
     renameSync(join(old, ".git"), bare);
     git(bare, "config", "core.bare", "true");
+    if (coreWorktree.ok) git(bare, "config", "--unset", "core.worktree");
     initContainerFiles(top);
     enableRelativePaths(top);
     git(top, "worktree", "add", "--no-checkout", flat, branch);
@@ -349,7 +354,7 @@ export function convert(path: string): string {
     const after = git(wt, "stash", "list", "--format=%H %gs");
     if (after !== stashes) fail(`stash list changed:\nbefore:\n${stashes}\nafter:\n${after}`);
   } catch (e) {
-    throw new Fail(`${(e as Error).message}\n\n${rollback(top, old, wt, bare, adminDir)}`);
+    throw new Fail(`${(e as Error).message}\n\n${rollback(top, old, wt, bare, adminDir, coreWorktree.ok ? coreWorktree.out : undefined)}`);
   }
 
   // HEAD reflog is per-worktree: graft the old one in front (git counts HEAD@{n} from the end).
@@ -368,6 +373,7 @@ export function convert(path: string): string {
   if (originHead.ok) git(top, "-c", "core.logAllRefUpdates=false", "symbolic-ref", "HEAD", `refs/heads/${originHead.out.replace(/^origin\//, "")}`);
   else log(`note: origin/HEAD is unknown, so new branches will start from ${branch}; run git remote set-head origin --auto to fix`);
 
+  if (coreWorktree.ok) log(`removed core.worktree=${coreWorktree.out} (redundant, and it conflicts with core.bare)`);
   const n = stashes ? stashes.split("\n").length : 0;
   log(`converted ${top}: worktree ${flat}/ on ${branch}, ${n} stash(es) intact`);
   if (process.cwd().startsWith(top)) log(`your shell's directory moved; run: cd ${JSON.stringify(wt)}`);
@@ -375,7 +381,7 @@ export function convert(path: string): string {
 }
 
 /** Reverse whatever convert got through, newest step first. Returns a status line. */
-function rollback(top: string, old: string, wt: string, bare: string, adminDir: string): string {
+function rollback(top: string, old: string, wt: string, bare: string, adminDir: string, coreWorktree?: string): string {
   const steps: [string, () => void][] = [
     ["index back", () => { if (existsSync(join(adminDir, "index"))) renameSync(join(adminDir, "index"), join(bare, "index")); }],
     ["tree back", () => { if (!existsSync(old) && existsSync(wt)) renameSync(wt, old); }],
@@ -388,6 +394,7 @@ function rollback(top: string, old: string, wt: string, bare: string, adminDir: 
     ["repository back", () => {
       if (existsSync(bare)) {
         run("git", ["--git-dir", bare, "config", "core.bare", "false"]);
+        if (coreWorktree !== undefined) run("git", ["--git-dir", bare, "config", "core.worktree", coreWorktree]);
         renameSync(bare, join(old, ".git"));
       }
     }],
