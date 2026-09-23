@@ -90,6 +90,12 @@ function initContainerFiles(container: string) {
   }
 }
 
+/** Worktree links become relative, so the whole container can be moved or renamed.
+ *  Sets extensions.relativeWorktrees on the first `worktree add`; older git versions can't read the repo then. */
+function enableRelativePaths(container: string) {
+  git(container, "config", "worktree.useRelativePaths", "true");
+}
+
 type Worktree = { path: string; branch?: string };
 
 function worktrees(container: string): Worktree[] {
@@ -247,6 +253,7 @@ function cloneInto(container: string, url: string): string {
   run("git", ["clone", "--quiet", "--no-checkout", `--separate-git-dir=${join(container, ".bare")}`, url, container]);
   git(join(container, ".bare"), "config", "core.bare", "true");
   initContainerFiles(container); // replaces clone's absolute gitdir pointer
+  enableRelativePaths(container);
   const def = defaultBranch(container);
   if (!gitTry(container, "rev-parse", "--verify", "--quiet", `refs/heads/${def}`).ok) {
     log(`cloned into ${container}; the remote has no commits yet, so no worktree was created`);
@@ -312,8 +319,9 @@ export function convert(path: string): string {
     renameSync(join(old, ".git"), bare);
     git(bare, "config", "core.bare", "true");
     initContainerFiles(top);
+    enableRelativePaths(top);
     git(top, "worktree", "add", "--no-checkout", flat, branch);
-    adminDir = readFileSync(join(wt, ".git"), "utf8").replace(/^gitdir: /, "").trim();
+    adminDir = resolve(wt, readFileSync(join(wt, ".git"), "utf8").replace(/^gitdir: /, "").trim());
     renameSync(join(wt, ".git"), join(old, ".git")); // the new worktree's pointer file
     rmdirSync(wt);
     renameSync(old, wt);

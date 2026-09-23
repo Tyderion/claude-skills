@@ -223,6 +223,20 @@ describe("convert", () => {
     expect(git(d2, "config", "core.bare")).toBe("false");
   });
 
+  test("cloned and converted containers survive being moved", () => {
+    const cl = join(root, "mv-clone");
+    expect(wt(root, "clone", join(root, "proj.git"), "--dir", cl).code).toBe(0);
+    const cv = checkout("mv-conv");
+    expect(wt(root, "convert", cv).code).toBe(0);
+    for (const [from, branch] of [[cl, "master"], [cv, "master"]] as const) {
+      const to = `${from}-moved`;
+      spawnSync("mv", [from, to]);
+      expect(git(join(to, branch), "status", "--porcelain")).toBe("");
+      expect(git(to, "worktree", "list")).not.toContain("prunable");
+      expect(wt(to, "add", "after-move").code).toBe(0);
+    }
+  });
+
   test("refuses a detached HEAD and an existing container", () => {
     const d = checkout("detached");
     git(d, "checkout", "-q", "--detach");
