@@ -1,16 +1,16 @@
 ---
-name: GitWorktree
+name: _GITWORKTREE
 version: 1.0.0
 description: Sets up and maintains bare-repo worktree containers (<container>/.bare + one peer folder per branch + files shared across worktrees) via the git-wt CLI — clone a URL into the layout, convert an existing checkout in place without losing stashes or reflog, add a worktree per branch, and sync shared files like .env or local databases as symlinks into every worktree. USE WHEN clone a repo, clone into coding, set up a repo, worktree setup, bare repo, .bare, git worktree, new worktree, work on two branches at once, convert repo to worktrees, share .env across worktrees, shared files between worktrees, git-wt. NOT FOR removing worktrees (plain `git worktree remove`) or general git history work.
 ---
 
-# GitWorktree
+# _GITWORKTREE
 
-Deterministic CLI: `git-wt` (on PATH) = `bun ~/.claude/skills/GitWorktree/Tools/GitWt.ts`. `git-wt --help` is the full contract.
+Deterministic CLI: `git-wt` (on PATH) = `bun ~/.claude/skills/_GITWORKTREE/Tools/GitWt.ts`. `git-wt --help` is the full contract.
 
 ## Customization
 
-Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/GitWorktree/PREFERENCES.md` if present; it can make this layout the default for every clone.
+Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/_GITWORKTREE/PREFERENCES.md` if present; it can make this layout the default for every clone.
 
 ## Workflow Routing
 
@@ -55,4 +55,4 @@ User: "both worktrees should use the same .env"
 - **`clone` is `git clone --no-checkout --separate-git-dir=.bare` + `core.bare true`, not `clone --bare`.** A bare clone copies every remote branch into `refs/heads` as local branches that fetch never updates, and writes no fetch refspec. This route leaves only the default branch local, everything else as `origin/*`, and `git worktree add <dir> <branch>` creates tracking branches on demand.
 - **Containers are movable.** `clone` and `convert` set `worktree.useRelativePaths`, so worktree links are relative. This enables `extensions.relativeWorktrees`, which older git versions cannot read; a GUI with an old bundled git will refuse the repo (Sublime Merge on this machine was confirmed working).
 - **`git wt --help` opens `man git-wt`** (git rewrites `--help` for every subcommand) and fails. Use `git wt -h` or `git-wt --help`.
-- **Run the tests after changing the tool:** `bun test ~/.claude/skills/GitWorktree/Tools/`.
+- **Run the tests after changing the tool:** `bun test ~/.claude/skills/_GITWORKTREE/Tools/`.
