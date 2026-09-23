@@ -72,6 +72,24 @@ describe("clone + add + sync", () => {
     expect(existsSync(join(root, "nope"))).toBe(false);
   });
 
+  test("plain errors for a missing path, a file as --dir, and a URL query", () => {
+    const missing = wt(root, "convert", join(root, "nope-dir"));
+    expect(missing.err).toContain("nope-dir does not exist");
+    expect(missing.err).not.toContain("ENOENT");
+    writeFileSync(join(root, "a-file"), "x");
+    const file = wt(root, "clone", join(root, "proj.git"), "--dir", join(root, "a-file"));
+    expect(file.code).toBe(1);
+    expect(file.err).toContain("is not a directory");
+    expect(file.err).not.toContain("    at ");
+  });
+
+  test("repoName ignores query strings and fragments", async () => {
+    const { repoName } = await import("./GitWt.ts");
+    expect(repoName("https://h/org/repo.git?x=1")).toBe("repo");
+    expect(repoName("https://h/org/repo#readme")).toBe("repo");
+    expect(repoName("git@github.com:org/repo.git")).toBe("repo");
+  });
+
   test("clone refuses a non-empty target", () => {
     expect(wt(root, "clone", join(root, "proj.git"), "--base", join(root, "coding")).code).toBe(1);
   });
@@ -152,6 +170,23 @@ describe("clone + add + sync", () => {
     rmSync(join(c, "gone"), { recursive: true });
     expect(wt(c, "add", "gone").code).toBe(0);
     expect(existsSync(join(c, "gone", "a.txt"))).toBe(true);
+  });
+
+  test("add names the branch that owns a colliding folder, and accepts --from=x", () => {
+    const r = wt(c, "add", "feature-x");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("already the worktree for feature/x");
+    expect(wt(c, "add", "eqform", "--from=master").code).toBe(0);
+  });
+
+  test("sync warns when a .gitignore re-includes a shared path", () => {
+    const w = join(c, "master");
+    writeFileSync(join(w, ".gitignore"), readFileSync(join(w, ".gitignore"), "utf8") + "!.env\n");
+    const r = wt(c, "sync");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`${join(w, ".env")}: not ignored`);
+    expect(r.out).not.toContain(`${join(c, "feature-x", ".env")}: not ignored`);
+    git(w, "checkout", "--", ".gitignore");
   });
 
   test("a symlinked route to the container still links correctly", () => {

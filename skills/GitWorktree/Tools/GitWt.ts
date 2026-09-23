@@ -47,6 +47,8 @@ const fail = (msg: string): never => { throw new Fail(msg); };
 const log = (msg: string) => console.log(msg);
 
 function run(cmd: string, args: string[], cwd?: string, allowFail = false) {
+  // spawn reports a missing cwd as the *command* being missing ("git: ENOENT").
+  if (cwd && !existsSync(cwd)) fail(`${cwd} does not exist`);
   const r = spawnSync(cmd, args, { cwd, encoding: "utf8", maxBuffer: 1 << 28 });
   if (r.error) fail(`${cmd}: ${r.error.message}`);
   if (r.status !== 0 && !allowFail) {
@@ -60,7 +62,7 @@ const gitTry = (cwd: string, ...args: string[]) => run("git", args, cwd, true);
 export const flatten = (branch: string) => branch.replace(/\//g, "-");
 
 export function repoName(url: string): string {
-  const last = url.replace(/[/\\]+$/, "").split(/[/:\\]/).pop() ?? "";
+  const last = url.replace(/[?#].*$/, "").replace(/[/\\]+$/, "").split(/[/:\\]/).pop() ?? "";
   const name = last.replace(/\.git$/, "");
   return name || fail(`cannot derive a repo name from "${url}"; pass --name`);
 }
@@ -228,6 +230,14 @@ export function sync(container: string, only?: string[]): { actions: Action[]; w
   // Only shrink the managed block when every worktree was visited, so a single-worktree
   // sync (from `add`) can't forget entries other worktrees still need pruned.
   writeManagedBlock(container, only ? [...new Set([...previous, ...entries])] : entries);
+  // info/exclude has the lowest precedence: a `!path` in a tracked .gitignore wins over it.
+  for (const wt of trees) {
+    for (const entry of entries) {
+      if (lstatOrNull(join(wt.path, entry))?.isSymbolicLink() && !gitTry(wt.path, "check-ignore", "-q", "--no-index", entry).ok) {
+        warnings.push(`${join(wt.path, entry)}: not ignored (a .gitignore rule re-includes it), so it shows as untracked; git add -A would commit the link`);
+      }
+    }
+  }
   return { actions, warnings };
 }
 
@@ -242,7 +252,9 @@ function reportSync(r: { actions: Action[]; warnings: string[] }) {
 export function clone(url: string, opts: { dir?: string; base?: string; name?: string }): string {
   const base = expandHome(opts.base ?? process.env.GIT_WT_BASE ?? "~/coding");
   const container = resolve(opts.dir ? expandHome(opts.dir) : join(base, opts.name ?? repoName(url)));
-  if (existsSync(container) && readdirSync(container).length) fail(`${container} already exists and is not empty`);
+  const st = lstatOrNull(container);
+  if (st && !st.isDirectory()) fail(`${container} exists and is not a directory`);
+  if (st && readdirSync(container).length) fail(`${container} already exists and is not empty`);
   const created = !existsSync(container);
   mkdirSync(container, { recursive: true });
   try {
@@ -279,7 +291,12 @@ function cloneInto(container: string, url: string): string {
 
 export function add(container: string, branch: string, from?: string): string {
   const folder = join(container, flatten(branch));
-  if (existsSync(folder)) fail(`${folder} already exists`);
+  if (existsSync(folder)) {
+    const owner = worktrees(container).find((w) => w.path === folder);
+    fail(owner?.branch && owner.branch !== branch
+      ? `${folder} is already the worktree for ${owner.branch}, which flattens to the same folder name`
+      : `${folder} already exists${owner ? ` (worktree for ${owner.branch ?? "a detached HEAD"})` : ""}`);
+  }
   const has = (ref: string) => gitTry(container, "rev-parse", "--verify", "--quiet", ref).ok;
   git(container, "worktree", "prune");
 
@@ -450,7 +467,10 @@ function parse(argv: string[]) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") flags.help = "1";
-    else if (a === "-C" || a.startsWith("--")) {
+    else if (a.startsWith("--") && a.includes("=")) {
+      const eq = a.indexOf("=");
+      flags[a.slice(2, eq)] = a.slice(eq + 1);
+    } else if (a === "-C" || a.startsWith("--")) {
       const key = a === "-C" ? "C" : a.slice(2);
       const val = argv[++i];
       if (val === undefined) fail(`${a} needs a value`);
