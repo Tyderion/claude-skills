@@ -21,6 +21,7 @@ Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/_GitWorktree/PREFERENCES.md` i
 | New worktree for a branch | `git-wt add <branch> [--from <start> \| --remote <name>] [-C <container>]`: tracks the branch from whichever remote has it; `--remote` picks when several do. On a GitHub remote it reuses a clean worktree whose PR was merged, if there is one |
 | New worktree, and never reuse | `git-wt add <branch> --fresh` |
 | Reuse a specific worktree for another branch | `git-wt reuse <worktree> <branch> [--from <start> \| --remote <name>]`: `<worktree>` is a folder, path or branch name |
+| Reuse a worktree, without naming which | Don't pick one. List the container's worktrees (`git worktree list`, leaving out the default branch's) and ask the principal which to reuse, then run `git-wt reuse` |
 | Share one file across worktrees (edits visible everywhere) | move it to the container root, list it under `[link]` in `<container>/.shared`, then `git-wt sync` |
 | Give each worktree its own editable copy of a default | put the default in the container root, list it under `[copy]`, then `git-wt sync` |
 | Throw away a worktree's edits to a copied file | `git-wt sync --reset <path>` (replaces every diverged copy with the root default) |
