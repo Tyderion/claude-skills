@@ -721,3 +721,298 @@ describe("convert", () => {
     expect(wt(root, "convert", join(root, "conv", "feature-x")).code).toBe(1);
   });
 });
+
+describe("reuse", () => {
+  let c: string;
+  let bare: string;
+  const ghDir = () => join(root, "gh");
+  const fixtures = () => join(ghDir(), "fixtures");
+  /** A fake gh: answers `pr list --head <b>` from fixtures/<b with / -> ->.json, logs every call. */
+  const ghEnv = () => ({ GIT_WT_GH: join(ghDir(), "gh"), GH_FIXTURES: fixtures(), GH_LOG: join(ghDir(), "calls") });
+  const wtGh = (cwd: string, ...a: string[]) => sh("bun", [TOOL, ...a], cwd, ghEnv());
+  const merged = (branch: string, oid: string, n = 7, at = "2026-10-01T00:00:00Z") =>
+    writeFileSync(join(fixtures(), `${branch.replace(/\//g, "-")}.json`), JSON.stringify([{ number: n, headRefOid: oid, mergedAt: at }]));
+  const ghCalls = () => (existsSync(join(ghDir(), "calls")) ? readFileSync(join(ghDir(), "calls"), "utf8") : "");
+  /** Push a commit to the remote's master, so local master is stale until a fetch. */
+  function advanceRemote(): string {
+    const tmp = mkdtempSync(join(root, "push-"));
+    git(root, "clone", "-q", bare, tmp);
+    writeFileSync(join(tmp, "later.txt"), "later\n");
+    git(tmp, "add", "."); git(tmp, "commit", "-qm", "later");
+    git(tmp, "push", "-q", "origin", "master");
+    return git(tmp, "rev-parse", "HEAD");
+  }
+
+  beforeAll(() => {
+    bare = makeRemote("reuse-r");
+    c = join(root, "reuseproj");
+    expect(wt(root, "clone", bare, "--dir", c).code).toBe(0);
+    writeFileSync(join(c, ".env"), "S=1\n");
+    writeFileSync(join(c, ".shared"), ".env\n");
+    expect(wt(c, "add", "feature/x").code).toBe(0);
+    mkdirSync(join(ghDir(), "fixtures"), { recursive: true });
+    writeFileSync(join(ghDir(), "gh"), [
+      "#!/bin/sh",
+      'echo "$@" >> "$GH_LOG"',
+      'while [ $# -gt 0 ]; do [ "$1" = --head ] && b=$2; shift; done',
+      'f="$GH_FIXTURES/$(printf %s "$b" | tr / -).json"',
+      'if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi',
+      "",
+    ].join("\n"), { mode: 0o755 });
+  });
+
+  test("renames the folder, checks out a new branch from the fetched remote default, keeps ignored files", () => {
+    mkdirSync(join(c, "feature-x", "build"));
+    writeFileSync(join(c, "feature-x", "build", "deps.bin"), "expensive\n");
+    const fresh = advanceRemote();
+    const r = wt(c, "reuse", "feature-x", "next/one");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("now next-one/ on next/one");
+    expect(r.out).toContain("feature/x is still a local branch");
+    const w = join(c, "next-one");
+    expect(existsSync(join(c, "feature-x"))).toBe(false);
+    expect(readFileSync(join(w, "build", "deps.bin"), "utf8")).toBe("expensive\n");
+    expect(git(w, "rev-parse", "--abbrev-ref", "HEAD")).toBe("next/one");
+    expect(git(w, "rev-parse", "HEAD")).toBe(fresh);
+    expect(sh("git", ["rev-parse", "--abbrev-ref", "@{u}"], w).code).not.toBe(0); // new branch, no upstream
+    expect(readFileSync(join(w, ".env"), "utf8")).toBe("S=1\n");
+    expect(git(c, "rev-parse", "--verify", "feature/x")).toMatch(/^[0-9a-f]{40}$/);
+    expect(git(c, "worktree", "list")).not.toContain("prunable");
+    expect(git(w, "status", "--porcelain")).toBe("");
+  });
+
+  test("tracks a remote branch, naming the worktree by its branch", () => {
+    git(bare, "branch", "remote-b", "master");
+    const r = wt(c, "reuse", "next/one", "remote-b");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("tracking origin/remote-b");
+    expect(git(join(c, "remote-b"), "rev-parse", "--abbrev-ref", "@{u}")).toBe("origin/remote-b");
+    expect(existsSync(join(c, "remote-b", "build", "deps.bin"))).toBe(true);
+  });
+
+  test("refuses tracked changes, untracked files and an occupied folder, changing nothing", () => {
+    const w = join(c, "remote-b");
+    writeFileSync(join(w, "a.txt"), "edited\n");
+    let r = wt(c, "reuse", "remote-b", "other");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("M a.txt");
+    git(w, "checkout", "--", "a.txt");
+    writeFileSync(join(w, "notes.md"), "mine\n");
+    r = wt(c, "reuse", "remote-b", "other");
+    expect(r.err).toContain("?? notes.md");
+    rmSync(join(w, "notes.md"));
+    r = wt(c, "reuse", "remote-b", "master");
+    expect(r.err).toContain("already exists");
+    expect(git(w, "rev-parse", "--abbrev-ref", "HEAD")).toBe("remote-b");
+    expect(existsSync(join(c, "other"))).toBe(false);
+    expect(sh("git", ["rev-parse", "--verify", "--quiet", "other"], c).code).not.toBe(0);
+  });
+
+  test("a failed move puts the worktree back on its branch and drops the branch it made", () => {
+    const r = sh("bun", [TOOL, "reuse", "remote-b", "doomed"], c, { GIT_WT_TEST: "fail:move" });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("is back on remote-b");
+    expect(git(join(c, "remote-b"), "rev-parse", "--abbrev-ref", "HEAD")).toBe("remote-b");
+    expect(sh("git", ["rev-parse", "--verify", "--quiet", "doomed"], c).code).not.toBe(0);
+  });
+
+  test("tells a shell inside the worktree where it went", () => {
+    const r = wt(join(c, "remote-b", "build"), "reuse", "remote-b", "moved");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`cd "${join(c, "moved", "build")}"`);
+  });
+
+  describe("automatic, on a GitHub remote", () => {
+    beforeAll(() => {
+      const url = "https://github.com/t/reuse.git";
+      git(c, "config", `url.${bare}.insteadOf`, url);
+      git(c, "remote", "set-url", "origin", url);
+      expect(git(c, "fetch", "-q", "origin")).toBe(""); // fetch still reaches the local bare
+    });
+
+    test("add reuses the worktree whose branch has a merged PR", () => {
+      expect(wt(c, "add", "done/a").code).toBe(0);
+      writeFileSync(join(c, "done-a", "work.txt"), "w\n");
+      git(join(c, "done-a"), "add", "."); git(join(c, "done-a"), "commit", "-qm", "work");
+      merged("done/a", git(join(c, "done-a"), "rev-parse", "HEAD"));
+      const r = wtGh(c, "add", "new/b");
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("reusing done-a/: done/a was merged in t/reuse#7");
+      expect(existsSync(join(c, "done-a"))).toBe(false);
+      expect(git(join(c, "new-b"), "rev-parse", "HEAD")).toBe(git(c, "rev-parse", "origin/master"));
+      expect(ghCalls()).toContain("--repo t/reuse --head done/a");
+    });
+
+    test("never the default branch, never with commits past the merged head, never with --fresh", () => {
+      merged("master", git(c, "rev-parse", "master"));
+      expect(wt(c, "add", "past/c").code).toBe(0);
+      const before = git(join(c, "past-c"), "rev-parse", "HEAD");
+      writeFileSync(join(c, "past-c", "more.txt"), "m\n");
+      git(join(c, "past-c"), "add", "."); git(join(c, "past-c"), "commit", "-qm", "after merge");
+      merged("past/c", before);
+      writeFileSync(join(ghDir(), "calls"), "");
+      // new/b's branch has no PR; moved and the rest likewise.
+      const r = wtGh(c, "add", "fresh/d");
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain("reusing");
+      expect(existsSync(join(c, "fresh-d"))).toBe(true);
+      expect(existsSync(join(c, "past-c"))).toBe(true);
+      expect(ghCalls()).not.toContain("--head master");
+
+      merged("fresh/d", git(join(c, "fresh-d"), "rev-parse", "HEAD"));
+      writeFileSync(join(ghDir(), "calls"), "");
+      const f = wtGh(c, "add", "fresh/e", "--fresh");
+      expect(f.out).not.toContain("reusing");
+      expect(existsSync(join(c, "fresh-d"))).toBe(true);
+      expect(ghCalls()).toBe("");
+    });
+
+    test("a dirty merged worktree is skipped; a missing gh is announced and add goes ahead", () => {
+      writeFileSync(join(c, "fresh-d", "scratch.txt"), "s\n");
+      const r = wtGh(c, "add", "fresh/f");
+      expect(r.out).not.toContain("reusing");
+      expect(existsSync(join(c, "fresh-d", "scratch.txt"))).toBe(true);
+      const g = sh("bun", [TOOL, "add", "fresh/g"], c, { GIT_WT_GH: join(root, "no-such-gh") });
+      expect(g.code).toBe(0);
+      expect(g.out).toContain("cannot ask GitHub for merged PRs");
+      expect(existsSync(join(c, "fresh-g"))).toBe(true);
+    });
+
+    test("a container without a GitHub remote never calls gh", () => {
+      const local = join(root, "no-gh");
+      expect(wt(root, "clone", makeRemote("no-gh-r"), "--dir", local).code).toBe(0);
+      expect(wt(local, "add", "feature/x").code).toBe(0);
+      writeFileSync(join(ghDir(), "calls"), "");
+      expect(wtGh(local, "add", "no-gh").code).toBe(0);
+      expect(ghCalls()).toBe("");
+    });
+  });
+});
+
+describe("reuse safety", () => {
+  let c: string;
+  let bare: string;
+  const gh = () => join(root, "gh2");
+  const ghEnv = () => ({ GIT_WT_GH: join(gh(), "gh"), GH_FIXTURES: gh(), GH_LOG: join(gh(), "calls") });
+  const wtGh = (cwd: string, ...a: string[]) => sh("bun", [TOOL, ...a], cwd, ghEnv());
+  const merged = (branch: string, oid: string, n = 7) =>
+    writeFileSync(join(gh(), `${branch.replace(/\//g, "-")}.json`), JSON.stringify([{ number: n, headRefOid: oid, mergedAt: "2026-10-01T00:00:00Z" }]));
+  const unmerge = (branch: string) => rmSync(join(gh(), `${branch.replace(/\//g, "-")}.json`), { force: true });
+  /** Run `fn` in a scratch clone of the remote, which it may commit in and push from. */
+  function onRemote(fn: (dir: string) => void) {
+    const tmp = mkdtempSync(join(root, "remote-work-"));
+    git(root, "clone", "-q", bare, tmp);
+    fn(tmp);
+  }
+
+  beforeAll(() => {
+    bare = makeRemote("safe-r");
+    c = join(root, "safeproj");
+    expect(wt(root, "clone", bare, "--dir", c).code).toBe(0);
+    writeFileSync(join(c, ".env"), "S=1\n");
+    writeFileSync(join(c, ".shared"), ".env\n");
+    expect(wt(c, "sync").code).toBe(0);
+    const url = "https://github.com/t/safe.git";
+    git(c, "config", `url.${bare}.insteadOf`, url);
+    git(c, "remote", "set-url", "origin", url);
+    mkdirSync(gh());
+    writeFileSync(join(gh(), "gh"), [
+      "#!/bin/sh",
+      'echo "$@" >> "$GH_LOG"',
+      'while [ $# -gt 0 ]; do [ "$1" = --head ] && b=$2; shift; done',
+      'f="$GH_FIXTURES/$(printf %s "$b" | tr / -).json"',
+      'if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi',
+      "",
+    ].join("\n"), { mode: 0o755 });
+    // Branches that track a normally ignored file, and the shared .env.
+    onRemote((d) => {
+      git(d, "checkout", "-qb", "tracks-ignored");
+      mkdirSync(join(d, "build"));
+      writeFileSync(join(d, "build", "keep.txt"), "FROM BRANCH\n");
+      git(d, "add", "-f", "build/keep.txt"); git(d, "commit", "-qm", "track ignored");
+      git(d, "checkout", "-q", "-b", "tracks-env", "master");
+      writeFileSync(join(d, ".env"), "BRANCH=1\n");
+      git(d, "add", "-f", ".env"); git(d, "commit", "-qm", "track env");
+      git(d, "push", "-q", "origin", "tracks-ignored", "tracks-env");
+    });
+    git(c, "fetch", "-q", "origin");
+  });
+
+  test("refuses to overwrite ignored files and shared links the branch tracks, changing nothing", () => {
+    expect(wt(c, "add", "clob/a").code).toBe(0);
+    const w = join(c, "clob-a");
+    mkdirSync(join(w, "build"));
+    writeFileSync(join(w, "build", "keep.txt"), "MINE\n");
+    const r = wt(c, "reuse", "clob-a", "tracks-ignored");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("build/keep.txt");
+    expect(wt(c, "reuse", "clob-a", "tracks-env").err).toMatch(/overwrite them:\n\s+\.env/);
+    expect(readFileSync(join(w, "build", "keep.txt"), "utf8")).toBe("MINE\n");
+    expect(lstatSync(join(w, ".env")).isSymbolicLink()).toBe(true);
+    expect(git(w, "rev-parse", "--abbrev-ref", "HEAD")).toBe("clob/a");
+  });
+
+  test("add falls back to a fresh worktree when the merged candidate refuses", () => {
+    merged("clob/a", git(join(c, "clob-a"), "rev-parse", "HEAD"));
+    const r = wtGh(c, "add", "tracks-ignored");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("not reusing clob-a/ after all, nothing changed");
+    expect(readFileSync(join(c, "clob-a", "build", "keep.txt"), "utf8")).toBe("MINE\n");
+    expect(readFileSync(join(c, "tracks-ignored", "build", "keep.txt"), "utf8")).toBe("FROM BRANCH\n");
+    unmerge("clob/a");
+  });
+
+  test("refuses worktrees outside the container and ones with populated submodules", () => {
+    git(c, "worktree", "add", "-q", join(root, "safe-outside"), "-b", "outside");
+    expect(wt(c, "reuse", join(root, "safe-outside"), "x1").err).toContain("outside the container");
+    expect(wt(c, "add", "sub/a").code).toBe(0);
+    const w = join(c, "sub-a");
+    git(w, "-c", "protocol.file.allow=always", "submodule", "add", "-q", makeRemote("safe-sub"), "mod");
+    git(w, "commit", "-qm", "submodule");
+    const r = wt(c, "reuse", "sub-a", "x2");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("submodules");
+    expect(git(w, "rev-parse", "--abbrev-ref", "HEAD")).toBe("sub/a");
+  });
+
+  test("a PR head that only exists on GitHub is fetched from refs/pull/<n>/head", () => {
+    expect(wt(c, "add", "done/m").code).toBe(0);
+    const w = join(c, "done-m");
+    writeFileSync(join(w, "m.txt"), "m\n");
+    git(w, "add", "."); git(w, "commit", "-qm", "m");
+    git(w, "push", "-q", "origin", "done/m");
+    let head = "";
+    onRemote((d) => { // the suggestion applied in the GitHub UI, then the branch deleted
+      git(d, "checkout", "-q", "done/m");
+      writeFileSync(join(d, "m.txt"), "suggested\n");
+      git(d, "commit", "-qam", "apply suggestion");
+      head = git(d, "rev-parse", "HEAD");
+      git(d, "push", "-q", "origin", "HEAD:refs/pull/9/head");
+    });
+    expect(sh("git", ["cat-file", "-e", head], c).code).not.toBe(0);
+    merged("done/m", head, 9);
+    const r = wtGh(c, "add", "next/m");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("reusing done-m/: done/m was merged in t/safe#9");
+    expect(existsSync(join(c, "next-m"))).toBe(true);
+  });
+
+  test("unreadable gh output is a warning, not a crash", () => {
+    writeFileSync(join(gh(), "tracks-ignored.json"), "not json");
+    const r = wtGh(c, "add", "after-junk");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("unreadable output");
+    expect(r.err).not.toContain("    at ");
+    unmerge("tracks-ignored");
+  });
+
+  test("githubRepo matches github.com only", async () => {
+    const { githubRepo } = await import("./GitWt.ts");
+    expect(githubRepo("git@github.com:o/r.git")).toBe("o/r");
+    expect(githubRepo("ssh://git@github.com/o/r")).toBe("o/r");
+    expect(githubRepo("https://github.com/o/r/")).toBe("o/r");
+    expect(githubRepo("https://notgithub.com/o/r.git")).toBeUndefined();
+    expect(githubRepo("https://mygithub.com/o/r")).toBeUndefined();
+    expect(githubRepo("git@github.company.com:o/r.git")).toBeUndefined();
+  });
+});

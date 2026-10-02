@@ -9,7 +9,7 @@
  *   <container>/<file>      a shared file's single real copy
  *   <container>/<worktree>/ one folder per branch, named after the branch with / -> -
  *
- * Subcommands: clone, convert, add, sync. Run with --help for usage.
+ * Subcommands: clone, convert, add, reuse, sync. Run with --help for usage.
  */
 import { spawnSync } from "node:child_process";
 import {
@@ -32,11 +32,20 @@ const USAGE = `git-wt — bare-repo worktree containers
       uncommitted tracked changes. Only renames: the tree becomes the first worktree,
       .git becomes .bare, the index and HEAD reflog carry over. Rolls back on failure.
 
-  git-wt add <branch> [--from <start> | --remote <name>] [-C <container>]
+  git-wt add <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]
       New worktree in <container>/<branch with / -> ->. Uses the local branch, else
       tracks <remote>/<branch> from whichever remote has it (--remote picks one when
       several do), else creates <branch> from --from (default: the default branch).
-      Then links shared files into it.
+      Then links shared files into it. With a GitHub remote, it first asks gh for a
+      clean worktree whose branch has a merged PR and reuses that one instead;
+      --fresh skips this.
+
+  git-wt reuse <worktree> <branch> [--from <start> | --remote <name>] [-C <container>]
+      Hand an existing worktree (folder, path or branch name) to <branch>: fetch,
+      check <branch> out in it (resolved like add, but new branches start from the
+      remote's default), then rename the folder. Ignored files such as node_modules
+      stay; tracked changes, untracked files, or untracked paths the branch would
+      overwrite refuse, before anything changes. The old branch is kept.
 
   git-wt sync [--reset <path>] [-C <container>]
       Apply .shared to every worktree. Bare lines and [link] entries become symlinks
@@ -49,6 +58,9 @@ const USAGE = `git-wt — bare-repo worktree containers
 
 class Fail extends Error {}
 const fail = (msg: string): never => { throw new Fail(msg); };
+/** A refusal raised before anything changed, so a caller may safely try another route. */
+class Refused extends Fail {}
+const refuse = (msg: string): never => { throw new Refused(msg); };
 const log = (msg: string) => console.log(msg);
 
 function run(cmd: string, args: string[], cwd?: string, allowFail = false) {
@@ -76,6 +88,13 @@ const expandHome = (p: string) => (p === "~" || p.startsWith("~/") ? join(homedi
 
 function lstatOrNull(p: string) {
   try { return lstatSync(p); } catch { return null; }
+}
+
+// Test-only fault injection: GIT_WT_TEST=crash:<at> dies without rollback, fail:<at> throws.
+function inject(at: string) {
+  const v = process.env.GIT_WT_TEST;
+  if (v === `crash:${at}`) process.exit(137);
+  if (v === `fail:${at}`) fail("injected test failure");
 }
 
 // ---------------------------------------------------------------- container
@@ -353,18 +372,15 @@ function cloneInto(container: string, url: string): string {
 
 // ---------------------------------------------------------------- add
 
-export function add(container: string, branch: string, from?: string, remote?: string): string {
-  if (from && remote) fail("--from starts a new branch and --remote tracks an existing one; pass only one");
-  const folder = join(container, flatten(branch));
-  if (existsSync(folder)) {
-    const owner = worktrees(container).find((w) => w.path === folder);
-    fail(owner?.branch && owner.branch !== branch
-      ? `${folder} is already the worktree for ${owner.branch}, which flattens to the same folder name`
-      : `${folder} already exists${owner ? ` (worktree for ${owner.branch ?? "a detached HEAD"})` : ""}`);
-  }
-  const has = (ref: string) => gitTry(container, "rev-parse", "--verify", "--quiet", ref).ok;
-  git(container, "worktree", "prune");
+/** What to pass after `worktree add <folder>` / `checkout` to land on a branch: options, then the ref. */
+type Checkout = { opts: string[]; ref: string; note?: string };
 
+/** The local branch, else <remote>/<branch> tracked from whichever remote has it, else a new
+ *  branch from `from` or the default branch. `remoteDefault` prefers <remote>/<default> over the
+ *  local default, for callers that just fetched and know the local one may be stale. */
+function planCheckout(container: string, branch: string, from?: string, remote?: string, remoteDefault = false): Checkout {
+  if (from && remote) fail("--from starts a new branch and --remote tracks an existing one; pass only one");
+  const has = (ref: string) => gitTry(container, "rev-parse", "--verify", "--quiet", ref).ok;
   // Which remotes carry a branch; a remote name can't be read off a ref, since it may contain '/'.
   const remotes = git(container, "remote").split("\n").filter(Boolean);
   const on = (b: string) => remotes.filter((r) => has(`refs/remotes/${r}/${b}`));
@@ -372,26 +388,216 @@ export function add(container: string, branch: string, from?: string, remote?: s
   const carriers = on(branch);
   if (has(`refs/heads/${branch}`)) {
     if (from || remote) fail(`branch ${branch} already exists locally; --from and --remote only apply when creating it`);
-    git(container, "worktree", "add", folder, branch);
-  } else if (!from && (remote || carriers.length)) {
+    return { opts: [], ref: branch };
+  }
+  if (!from && (remote || carriers.length)) {
     if (remote && !carriers.includes(remote)) {
       fail(`${remote}/${branch} does not exist${carriers.length ? `; it is on ${carriers.join(", ")}` : remotes.includes(remote) ? " (git fetch first?)" : `: no remote named ${remote}`}`);
     }
     if (!remote && carriers.length > 1) fail(`${branch} exists on ${carriers.join(", ")}; pick one with --remote <name>`);
     const r = remote ?? carriers[0];
-    git(container, "worktree", "add", "--track", "-b", branch, folder, `${r}/${branch}`);
-    log(`tracking ${r}/${branch}`);
-  } else {
-    const def = defaultBranch(container);
-    // After convert on a feature branch the default may exist only on a remote (origin preferred).
-    const defRemotes = on(def).sort((a, b) => Number(b === "origin") - Number(a === "origin"));
-    const start = from ?? (has(`refs/heads/${def}`) ? def : defRemotes[0] ? `${defRemotes[0]}/${def}` : fail(`default branch ${def} not found locally or on any remote; pass --from <start>`));
-    git(container, "worktree", "add", "--no-track", "-b", branch, folder, start);
-    log(`created new branch ${branch} from ${start}`);
+    return { opts: ["--track", "-b", branch], ref: `${r}/${branch}`, note: `tracking ${r}/${branch}` };
   }
+  const def = defaultBranch(container);
+  // After convert on a feature branch the default may exist only on a remote (origin preferred).
+  const defRemotes = on(def).sort((a, b) => Number(b === "origin") - Number(a === "origin"));
+  const local = has(`refs/heads/${def}`) ? def : undefined;
+  const tracked = defRemotes[0] ? `${defRemotes[0]}/${def}` : undefined;
+  const start = from ?? (remoteDefault ? tracked ?? local : local ?? tracked)
+    ?? fail(`default branch ${def} not found locally or on any remote; pass --from <start>`);
+  return { opts: ["--no-track", "-b", branch], ref: start, note: `created new branch ${branch} from ${start}` };
+}
+
+function folderFree(container: string, folder: string, branch: string) {
+  if (!existsSync(folder)) return;
+  const owner = worktrees(container).find((w) => w.path === folder);
+  fail(owner?.branch && owner.branch !== branch
+    ? `${folder} is already the worktree for ${owner.branch}, which flattens to the same folder name`
+    : `${folder} already exists${owner ? ` (worktree for ${owner.branch ?? "a detached HEAD"})` : ""}`);
+}
+
+export function add(container: string, branch: string, from?: string, remote?: string, fresh = false): string {
+  const folder = join(container, flatten(branch));
+  folderFree(container, folder, branch);
+  git(container, "worktree", "prune");
+  if (!fresh) {
+    const merged = findMerged(container);
+    if (merged) {
+      const name = basename(merged.wt.path);
+      log(`reusing ${name}/: ${merged.wt.branch} was merged in ${merged.repo}#${merged.pr} (pass --fresh for a new worktree)`);
+      try {
+        return reuse(container, merged.wt.path, branch, from, remote);
+      } catch (e) {
+        if (!(e instanceof Refused)) throw e;
+        log(`not reusing ${name}/ after all, nothing changed: ${e.message}`);
+      }
+    }
+  }
+  const plan = planCheckout(container, branch, from, remote);
+  git(container, "worktree", "add", ...plan.opts, folder, plan.ref);
+  if (plan.note) log(plan.note);
   reportSync(sync(container, { only: [folder] }));
   log(`worktree ${flatten(branch)}/ on ${branch}`);
   return folder;
+}
+
+// ---------------------------------------------------------------- reuse
+
+/** Why a worktree can't be handed to another branch, or undefined when it can. Ignored files
+ *  (node_modules, build output) are what reuse exists to keep, so only tracked changes and
+ *  untracked-but-not-ignored files count; shared paths are git-wt's own and never count. */
+function notReusable(container: string, wt: Worktree): string | undefined {
+  if (wt.locked) return "is locked";
+  // Shared links are relative to a folder directly in the container; elsewhere they'd dangle after the move.
+  if (dirname(wt.path) !== container) return "sits outside the container folder";
+  // `git worktree move` refuses these; finding out after the checkout means a rollback.
+  if (gitTry(wt.path, "submodule", "status").out.split("\n").some((l) => l && !l.startsWith("-"))) return "has populated submodules, which git cannot move";
+  for (const f of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG"]) {
+    if (existsSync(resolve(wt.path, git(wt.path, "rev-parse", "--git-path", f)))) return `has an operation in progress (${f})`;
+  }
+  const { link, copy } = readShared(container);
+  const ours = [...link, ...copy];
+  const dirty = git(wt.path, "status", "--porcelain").split("\n").filter(Boolean)
+    .filter((l) => !ours.some((p) => l.slice(3).replace(/\/$/, "") === p || l.slice(3).startsWith(p + "/")));
+  return dirty.length ? `has uncommitted changes or untracked files:\n  ${dirty.join("\n  ")}` : undefined;
+}
+
+/** Paths present in `dir` but untracked there (ignored files, shared links and copies) that
+ *  checking out `ref` would replace with tracked ones. Git overwrites those without asking. */
+function wouldOverwrite(dir: string, ref: string): string[] {
+  const tracked = new Set(git(dir, "ls-files", "-z").split("\0").filter(Boolean));
+  const seen = new Map<string, boolean>();
+  const inTheWay = (p: string, isLeaf: boolean): boolean => {
+    if (tracked.has(p)) return false;
+    const key = `${isLeaf}:${p}`;
+    if (!seen.has(key)) {
+      const st = lstatOrNull(join(dir, p));
+      // A leaf is in the way if anything sits there; a parent only if it isn't a directory.
+      seen.set(key, !!st && (isLeaf || !st.isDirectory()));
+    }
+    return seen.get(key)!;
+  };
+  const hits = new Set<string>();
+  for (const p of git(dir, "ls-tree", "-r", "-z", "--name-only", ref).split("\0").filter(Boolean)) {
+    const parts = p.split("/");
+    for (let i = 1; i < parts.length; i++) {
+      const parent = parts.slice(0, i).join("/");
+      if (inTheWay(parent, false)) hits.add(parent);
+    }
+    if (inTheWay(p, true)) hits.add(p);
+  }
+  return [...hits];
+}
+
+export function reuse(container: string, which: string, branch: string, from?: string, remote?: string): string {
+  const all = worktrees(container);
+  const paths = [existsSync(which) ? realpathSync(which) : "", join(container, which), join(container, flatten(which))];
+  const wt = all.find((w) => paths.includes(w.path)) ?? all.find((w) => w.branch === which)
+    ?? fail(`no worktree "${which}" in ${container}; name it by folder, path or branch`);
+  const folder = join(container, flatten(branch));
+  if (folder !== wt.path) folderFree(container, folder, branch);
+  const why = notReusable(container, wt);
+  if (why) refuse(`${wt.path} ${why}\nreuse keeps ignored files only; commit, stash or remove the rest first`);
+
+  // Reuse usually follows a merge, so the local default branch is behind: fetch, then start new
+  // branches from the remote's default. Offline still works, from whatever refs are local.
+  const fetched = gitTry(container, "fetch", "--all", "--prune", "--quiet");
+  if (!fetched.ok) log(`warning: fetch failed, using local refs:\n  ${fetched.err.trim()}`);
+  git(container, "worktree", "prune");
+  const plan = planCheckout(container, branch, from, remote, true);
+  const was = wt.branch ?? wt.head!;
+  const clobbered = wouldOverwrite(wt.path, plan.ref);
+  if (clobbered.length) {
+    refuse(`${plan.ref} tracks paths that exist untracked in ${wt.path}, and checking it out would overwrite them:\n  ${clobbered.join("\n  ")}\nmove them aside first, or start a fresh worktree`);
+  }
+
+  // Checkout before the move: it is the step that can still refuse (branch in use elsewhere),
+  // and undoing it is one checkout.
+  git(wt.path, "checkout", "--quiet", ...plan.opts, plan.ref);
+  if (folder !== wt.path) {
+    try {
+      inject("move");
+      git(container, "worktree", "move", wt.path, folder);
+    } catch (e) {
+      const back = gitTry(wt.path, "checkout", "--quiet", ...(wt.branch ? [wt.branch] : ["--detach", wt.head!]));
+      // A branch this call created holds no commits yet; anything else is left alone.
+      if (back.ok && plan.opts.includes("-b")) gitTry(container, "branch", "-D", branch);
+      throw new Fail(`${(e as Error).message}\n${back.ok ? `${wt.path} is back on ${was}` : `could not switch ${wt.path} back to ${was}: ${back.err.trim()}`}`);
+    }
+  }
+  if (plan.note) log(plan.note);
+  // Links are relative and every worktree sits at the same depth, so the moved ones still resolve;
+  // this only adds entries .shared gained since.
+  try {
+    reportSync(sync(container, { only: [folder] }));
+  } catch (e) {
+    if (!(e instanceof Fail)) throw e;
+    throw new Fail(`worktree ${basename(wt.path)}/ is now ${flatten(branch)}/ on ${branch}, but its shared files need attention:\n${e.message}`);
+  }
+  if (wt.branch && wt.branch !== branch) log(`${wt.branch} is still a local branch; nothing was deleted`);
+  log(`worktree ${basename(wt.path)}/ is now ${flatten(branch)}/ on ${branch}`);
+  const cwd = process.cwd();
+  if (cwd === wt.path || cwd.startsWith(wt.path + sep)) log(`your shell's directory moved; run: cd ${JSON.stringify(join(folder, relative(wt.path, cwd)))}`);
+  return folder;
+}
+
+/** `owner/repo` on github.com, from a clone URL, or undefined for any other host. */
+export function githubRepo(url: string): string | undefined {
+  const m = /^(?:[a-z+]+:\/\/)?(?:[^@/]+@)?github\.com[:/]+([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i.exec(url);
+  return m ? `${m[1]}/${m[2]}` : undefined;
+}
+
+/** GitHub repos behind the container's remotes, each with one remote to fetch PR heads from. Read
+ *  raw from config: `git remote get-url` applies url.*.insteadOf, which can hide the GitHub address. */
+function githubRemotes(container: string): { repo: string; remote: string }[] {
+  const byRepo = new Map<string, string>();
+  for (const line of gitTry(container, "config", "--get-regexp", "^remote\\..*\\.url$").out.split("\n").filter(Boolean)) {
+    const [, remote, url] = /^remote\.(.*)\.url\s+(.*)$/.exec(line) ?? [];
+    const repo = url && githubRepo(url);
+    if (repo && !byRepo.has(repo)) byRepo.set(repo, remote);
+  }
+  return [...byRepo].map(([repo, remote]) => ({ repo, remote }));
+}
+
+type Merged = { wt: Worktree; repo: string; pr: number; mergedAt: string };
+
+/** The clean worktree whose branch was merged most recently on GitHub. Merged means a merged PR
+ *  whose head commit is the worktree's HEAD or descends from it, so commits made after the merge
+ *  disqualify it. The default branch's worktree is never a candidate. */
+function findMerged(container: string): Merged | undefined {
+  const remotes = githubRemotes(container);
+  if (!remotes.length) return;
+  const def = defaultBranch(container);
+  const candidates = worktrees(container).filter((w) => w.branch && w.branch !== def && w.head && !notReusable(container, w));
+  const gh = process.env.GIT_WT_GH ?? "gh"; // tests point this at a fake
+  const skip = (why: string): undefined => { log(`warning: ${why}; not reusing a worktree`); return undefined; };
+  const known = (oid: string) => gitTry(container, "cat-file", "-e", `${oid}^{commit}`).ok;
+  let best: Merged | undefined;
+  for (const wt of candidates) for (const { repo, remote } of remotes) {
+    const r = spawnSync(gh, ["pr", "list", "--repo", repo, "--head", wt.branch!, "--state", "merged", "--json", "number,headRefOid,mergedAt", "--limit", "20"], { encoding: "utf8" });
+    if (r.error || r.status !== 0) return skip(`cannot ask GitHub for merged PRs (${r.error?.message ?? (r.stderr || r.stdout).trim()})`);
+    let prs: { number: number; headRefOid: string; mergedAt: string }[];
+    try {
+      prs = JSON.parse(r.stdout);
+      if (!Array.isArray(prs)) throw new Error("not a list");
+    } catch (e) {
+      return skip(`gh pr list gave unreadable output (${(e as Error).message})`);
+    }
+    for (const pr of prs) {
+      // A head made on GitHub (an applied review suggestion) or pushed from elsewhere isn't local,
+      // and its branch may be deleted; GitHub keeps every PR head at refs/pull/<n>/head.
+      if (pr.headRefOid !== wt.head && !known(pr.headRefOid)) {
+        gitTry(container, "fetch", "--quiet", remote, `refs/pull/${pr.number}/head`);
+        if (!known(pr.headRefOid)) {
+          log(`warning: cannot fetch the head of ${repo}#${pr.number}, so ${wt.branch} is not counted as merged`);
+          continue;
+        }
+      }
+      const contained = pr.headRefOid === wt.head || gitTry(wt.path, "merge-base", "--is-ancestor", wt.head!, pr.headRefOid).ok;
+      if (contained && (!best || pr.mergedAt > best.mergedAt)) best = { wt, repo, pr: pr.number, mergedAt: pr.mergedAt };
+    }
+  }
+  return best;
 }
 
 // ---------------------------------------------------------------- convert
@@ -494,12 +700,6 @@ export function convert(path: string): string {
   // the listener stays for the life of the process. Ctrl-C still reaches the git child in
   // the foreground group, so that step fails and the normal rollback runs.
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => {});
-  // Test-only fault injection: GIT_WT_TEST=crash:<at> dies without rollback, fail:<at> throws.
-  const inject = (at: string) => {
-    const v = process.env.GIT_WT_TEST;
-    if (v === `crash:${at}`) process.exit(137);
-    if (v === `fail:${at}`) fail("injected test failure");
-  };
 
   // Every step is a rename, so nothing is copied or deleted and each step can be reversed.
   // `rename(2)` can't move a directory into its own child, hence the .pre-wt staging name.
@@ -652,7 +852,8 @@ const container = { type: "string", short: "C" } as const;
 const OPTIONS = {
   clone: { dir: str, base: str, name: str },
   convert: {},
-  add: { from: str, remote: str, C: container },
+  add: { from: str, remote: str, fresh: { type: "boolean" }, C: container },
+  reuse: { from: str, remote: str, C: container },
   sync: { reset: str, C: container },
 } as const;
 
@@ -677,8 +878,11 @@ function main(argv: string[]) {
       if (pos.length > 1) fail("usage: git-wt convert [<path>]");
       return void convert(pos[0] ?? process.cwd());
     case "add":
-      if (pos.length !== 1) fail("usage: git-wt add <branch> [--from <start> | --remote <name>] [-C <container>]");
-      return void add(findContainer(flags.C ?? process.cwd()), pos[0], flags.from, flags.remote);
+      if (pos.length !== 1) fail("usage: git-wt add <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]");
+      return void add(findContainer(flags.C ?? process.cwd()), pos[0], flags.from, flags.remote, Boolean(values.fresh));
+    case "reuse":
+      if (pos.length !== 2) fail("usage: git-wt reuse <worktree> <branch> [--from <start> | --remote <name>] [-C <container>]");
+      return void reuse(findContainer(flags.C ?? process.cwd()), pos[0], pos[1], flags.from, flags.remote);
     case "sync":
       if (pos.length) fail("usage: git-wt sync [--reset <path>] [-C <container>]");
       return reportSync(sync(findContainer(flags.C ?? process.cwd()), { reset: flags.reset }));
