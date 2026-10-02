@@ -10,9 +10,11 @@ Claude Code skills, kept in git so every machine gets the same ones.
 ## Setup
 
 ```sh
-git-wt clone <this repo's url>      # or a plain git clone on a machine without git-wt yet
-~/coding/claude-skills/main/setup
+git clone https://github.com/Tyderion/claude-skills.git
+claude-skills/setup
 ```
+
+Once `git-wt` is installed, later clones can use the worktree layout instead: `git-wt clone https://github.com/Tyderion/claude-skills.git`, then `claude-skills/main/setup`.
 
 `setup` copies each `skills/<name>/` to `~/.claude/skills/`, as `_<name>` when the machine runs LifeOS and as `<name>` otherwise (`--prefix` / `--no-prefix` override). It fills in `{{SKILL_NAME}}`, `{{SKILL_DIR}}` and `{{SOURCE_DIR}}`, writes shims such as `git-wt` to `~/.local/bin`, and checks the commands each skill needs.
 
@@ -40,6 +42,6 @@ bin      <name> <script, relative to the skill>
 
 A manager left out means it has no package for that command, so setup asks Claude to install it. `setup` itself never needs to change.
 
-## Keep this repo private
+## Personal details
 
-The skills grew out of a private Claude setup. Don't push this to a public remote without reading every skill for personal details first.
+This repo is public. Keep machine paths, usernames and anything personal out of it: skills read such things at run time (a preferences file, an env var), never from their own text.
