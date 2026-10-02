@@ -1,16 +1,16 @@
 ---
-name: _GitWorktree
+name: {{SKILL_NAME}}
 version: 1.0.0
 description: Bare-repo worktree containers via the git-wt CLI: clone into <container>/.bare + one folder per branch, convert a checkout in place, add a worktree per branch, reuse a merged worktree for a new branch (keeps node_modules), and share files like .env across worktrees. USE WHEN clone a repo, clone into coding, set up a repo, bare repo, .bare, git worktree, new worktree, work on two branches at once, reuse or recycle a worktree, avoid reinstalling dependencies, convert repo to worktrees, share .env across worktrees, git-wt. NOT FOR removing worktrees or general git history work.
 ---
 
-# _GitWorktree
+# {{SKILL_NAME}}
 
-Deterministic CLI: `git-wt` (on PATH) = `bun ~/.claude/skills/_GitWorktree/Tools/GitWt.ts`. `git-wt --help` is the full contract.
+Deterministic CLI: `git-wt` (on PATH) = `bun {{SKILL_DIR}}/Tools/GitWt.ts`. `git-wt --help` is the full contract.
 
 ## Customization
 
-Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/_GitWorktree/PREFERENCES.md` if present; it can make this layout the default for every clone.
+Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/{{SKILL_NAME}}/PREFERENCES.md` if present; it can make this layout the default for every clone.
 
 ## Workflow Routing
 
@@ -67,4 +67,4 @@ User: "start on feature/y" (feature-x/'s PR is merged on GitHub)
 - **`clone` is `git clone --no-checkout --separate-git-dir=.bare` + `core.bare true`, not `clone --bare`.** A bare clone copies every remote branch into `refs/heads` as local branches that fetch never updates, and writes no fetch refspec. This route leaves only the default branch local, everything else as `origin/*`, and `git worktree add <dir> <branch>` creates tracking branches on demand.
 - **Containers are movable.** `clone` and `convert` set `worktree.useRelativePaths`, so worktree links are relative. This enables `extensions.relativeWorktrees`, which older git versions cannot read; a GUI with an old bundled git will refuse the repo (Sublime Merge on this machine was confirmed working).
 - **`git wt --help` opens `man git-wt`** (git rewrites `--help` for every subcommand) and fails. Use `git wt -h` or `git-wt --help`.
-- **Run the tests after changing the tool:** `bun test ~/.claude/skills/_GitWorktree/Tools/`.
+- **This is an installed copy; the source is `{{SOURCE_DIR}}`.** Change the tool there, run `bun test Tools/` in that folder, commit, then rerun the repo's `./setup`. Setup refuses to overwrite a copy that was edited in place, so carry any such edit over to the source first.

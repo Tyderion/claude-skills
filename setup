@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# Install this repo's skills into Claude Code and the commands they need.
+# Bash on purpose: it runs on a fresh machine before bun exists, and it stays
+# within bash 3.2 (macOS's /bin/bash): no associative arrays, no mapfile, no set -u.
+set -eo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./setup [--prefix | --no-prefix] [--yes] [--force] [<skill>...]
+
+Copies skills/<name>/ to ~/.claude/skills/[_]<name>/ (CLAUDE_CONFIG_DIR moves
+~/.claude), fills in {{SKILL_NAME}}, {{SKILL_DIR}} and {{SOURCE_DIR}}, writes a
+bun shim to ~/.local/bin (XDG_BIN_HOME moves it) for each `bin` entry, and makes
+sure the commands every skill's install.conf asks for are there.
+
+  --prefix      install as _<name> (the default when ~/.claude/LIFEOS exists)
+  --no-prefix   install as <name>
+  --yes         install missing packages without asking
+  --force       replace installed copies edited in place, and files setup did
+                not write; they are moved to a backup folder, never deleted
+
+Missing commands come from pacman on Arch-family Linux and from Homebrew on
+macOS. Anywhere else, or for anything those can't provide, setup prints a
+prompt to paste into Claude Code and exits 2. Rerun after every pull.
+EOF
+}
+
+REPO=$(cd "$(dirname "$0")" && pwd -P)
+CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+BIN_DIR=${XDG_BIN_HOME:-$HOME/.local/bin}
+BACKUP_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/claude-skills/backup
+OS_RELEASE=${SETUP_OS_RELEASE:-/etc/os-release} # tests point these two at fakes
+KERNEL=${SETUP_UNAME:-$(uname -s)}
+MARKER=.skill-install
+SHIM_TAG="# installed by claude-skills setup"
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() { printf 'setup: %s\n' "$*" >&2; exit 1; }
+tilde() { case $1 in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+
+prefix=""
+if [ -d "$CLAUDE_DIR/LIFEOS" ]; then prefix=_; fi
+yes=0 force=0 skills=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --prefix) prefix=_ ;;
+    --no-prefix) prefix= ;;
+    -y|--yes) yes=1 ;;
+    --force) force=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; die "unknown option $1" ;;
+    *) skills+=("$1") ;;
+  esac
+  shift
+done
+if [ ${#skills[@]} -eq 0 ]; then
+  for d in "$REPO"/skills/*/; do [ -f "$d/SKILL.md" ] && skills+=("$(basename "$d")"); done
+fi
+[ ${#skills[@]} -gt 0 ] || die "no skills found in $REPO/skills"
+for s in "${skills[@]}"; do [ -f "$REPO/skills/$s/SKILL.md" ] || die "no skill named $s in $REPO/skills"; done
+
+# install.conf lines without comments or blank lines. A comment needs a space before its #.
+conf() {
+  local f="$REPO/skills/$1/install.conf"
+  if [ -f "$f" ]; then sed -e 's/[[:space:]]#.*$//' -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$f"; fi
+}
+
+# ---------------------------------------------------------------- dependencies
+
+# Package manager for this machine: pacman (Arch family), brew (macOS), or empty.
+manager() {
+  if [ "$KERNEL" = Darwin ]; then
+    if command -v brew >/dev/null 2>&1; then echo brew; fi
+  elif [ -r "$OS_RELEASE" ] && (. "$OS_RELEASE"; case " $ID $ID_LIKE " in *" arch "*) exit 0 ;; *) exit 1 ;; esac) \
+    && command -v pacman >/dev/null 2>&1; then
+    echo pacman
+  fi
+}
+
+# Is dotted version $1 at least $2?
+ver_ge() {
+  local IFS=. i x y
+  local -a a b
+  a=($1) b=($2)
+  for i in 0 1 2 3; do
+    x=${a[i]:-0} y=${b[i]:-0}
+    if ((10#$x > 10#$y)); then return 0; fi
+    if ((10#$x < 10#$y)); then return 1; fi
+  done
+}
+version_of() { "$1" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true; }
+
+# Every dependency once, across all skills: parallel arrays, since bash 3.2 has no maps.
+# A command any skill requires is required; the highest minimum version wins.
+d_cmd=() d_req=() d_min=() d_arch=() d_brew=() d_why=()
+add_dep() { # kind cmd min arch brew why
+  local i=0
+  while [ $i -lt ${#d_cmd[@]} ]; do
+    if [ "${d_cmd[i]}" = "$2" ]; then
+      if [ "$1" = require ]; then d_req[i]=1; fi
+      if [ "$3" != - ] && { [ "${d_min[i]}" = - ] || ! ver_ge "${d_min[i]}" "$3"; }; then d_min[i]=$3; fi
+      if [ -z "${d_arch[i]}" ]; then d_arch[i]=$4; fi
+      if [ -z "${d_brew[i]}" ]; then d_brew[i]=$5; fi
+      return
+    fi
+    i=$((i + 1))
+  done
+  d_cmd+=("$2"); d_min+=("$3"); d_arch+=("$4"); d_brew+=("$5"); d_why+=("$6")
+  if [ "$1" = require ]; then d_req+=(1); else d_req+=(0); fi
+}
+
+for s in "${skills[@]}"; do
+  while read -r kind rest; do
+    case $kind in
+      require|optional)
+        set -- $rest
+        [ $# -ge 2 ] || die "skills/$s/install.conf: '$kind $rest' needs <command> <min version|->"
+        cmd=$1 min=$2 arch= brew= why=
+        shift 2
+        while [ $# -gt 0 ]; do
+          case $1 in
+            arch=*) arch=${1#arch=} ;;
+            brew=*) brew=${1#brew=} ;;
+            --) shift; why=$*; break ;;
+            *) die "skills/$s/install.conf: unexpected '$1' in: $kind $rest" ;;
+          esac
+          shift
+        done
+        add_dep "$kind" "$cmd" "$min" "$arch" "$brew" "$why"
+        ;;
+      bin) ;;
+      *) die "skills/$s/install.conf: unknown entry '$kind'" ;;
+    esac
+  done < <(conf "$s")
+done
+
+# Indexes of dependencies that are absent or too old, in `missing`.
+check_deps() {
+  missing=()
+  local i=0 have
+  while [ $i -lt ${#d_cmd[@]} ]; do
+    if ! command -v "${d_cmd[i]}" >/dev/null 2>&1; then
+      missing+=($i)
+    elif [ "${d_min[i]}" != - ]; then
+      have=$(version_of "${d_cmd[i]}")
+      if [ -z "$have" ] || ! ver_ge "$have" "${d_min[i]}"; then missing+=($i); fi
+    fi
+    i=$((i + 1))
+  done
+}
+
+describe_dep() { # index -> "bun >= 1.1 (required; found 1.0.3)"
+  local i=$1 have=none what=required
+  if command -v "${d_cmd[i]}" >/dev/null 2>&1; then have=$(version_of "${d_cmd[i]}"); have="${have:-unknown version} at $(command -v "${d_cmd[i]}")"; fi
+  if [ "${d_req[i]}" = 0 ]; then what="optional, for ${d_why[i]}"; fi
+  printf '%s' "${d_cmd[i]}"
+  if [ "${d_min[i]}" != - ]; then printf ' >= %s' "${d_min[i]}"; fi
+  printf ' (%s; found: %s)' "$what" "$have"
+}
+
+check_deps
+mgr=$(manager)
+pm_ran=0
+if [ ${#missing[@]} -gt 0 ] && [ -n "$mgr" ]; then
+  pkgs=()
+  for i in "${missing[@]}"; do
+    if [ "$mgr" = pacman ]; then p=${d_arch[i]}; else p=${d_brew[i]}; fi
+    if [ -n "$p" ]; then pkgs+=("$p"); fi
+  done
+  if [ ${#pkgs[@]} -gt 0 ]; then
+    if [ "$mgr" = pacman ]; then
+      run=(pacman -S --needed "${pkgs[@]}")
+      if [ "$(id -u)" != 0 ]; then run=(sudo "${run[@]}"); fi
+    else
+      run=(brew install "${pkgs[@]}")
+    fi
+    say "missing:"
+    for i in "${missing[@]}"; do say "  $(describe_dep "$i")"; done
+    go=$yes
+    if [ $go = 0 ] && [ -t 0 ]; then
+      printf 'run: %s ? [Y/n] ' "${run[*]}"
+      read -r answer || answer=n
+      case $answer in ''|y|Y|yes) go=1 ;; esac
+    fi
+    if [ $go = 1 ]; then
+      say "running: ${run[*]}"
+      "${run[@]}" || warn "${run[0]} failed; see above"
+      pm_ran=1
+      hash -r
+      check_deps
+    else
+      say "not installing anything without a terminal to ask in; run this yourself, or rerun with --yes:"
+      say "  ${run[*]}"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------- skills
+
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
+# Content hash of a directory: every file's path and bytes, the marker excluded.
+hash_tree() {
+  (cd "$1" && find . -type f ! -name "$MARKER" | LC_ALL=C sort | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f"; done) | sha256
+}
+marker_get() { sed -n "s/^$2=//p" "$1/$MARKER" 2>/dev/null || true; }
+
+# Put $1 out of the way: our own unedited copy is deleted (the repo can rebuild it),
+# anything else needs --force and is moved to the backup folder.
+clear_path() {
+  local path=$1 why=$2 dest
+  if [ -z "$why" ]; then rm -rf "$path"; return; fi
+  [ $force = 1 ] || die "$why
+rerun with --force to move it to $(tilde "$BACKUP_DIR") and continue"
+  mkdir -p "$BACKUP_DIR"
+  dest="$BACKUP_DIR/$(basename "$path").$(date +%Y%m%d-%H%M%S)"
+  mv "$path" "$dest"
+  say "backed up $(tilde "$path") to $(tilde "$dest")"
+}
+
+# Why an existing skill folder may not simply be replaced, or nothing if it may.
+blocker() {
+  local dir=$1
+  if [ ! -f "$dir/$MARKER" ]; then
+    echo "$(tilde "$dir") was not installed by this setup"
+  elif [ "$(hash_tree "$dir")" != "$(marker_get "$dir" hash)" ]; then
+    echo "$(tilde "$dir") was edited after setup installed it; carry the edit over to $(tilde "$(marker_get "$dir" source)") (compare: diff -r $(tilde "$(marker_get "$dir" source)") $(tilde "$dir"))"
+  fi
+}
+
+# sed replacement text: escape \, | and &.
+sed_text() { printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'; }
+
+commit=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo none)
+mkdir -p "$CLAUDE_DIR/skills"
+installed=()
+for s in "${skills[@]}"; do
+  src="$REPO/skills/$s"
+  name=$prefix$s
+  dest="$CLAUDE_DIR/skills/$name"
+  if [ -z "$prefix" ]; then other="$CLAUDE_DIR/skills/_$s"; else other="$CLAUDE_DIR/skills/$s"; fi
+  state=$commit
+  if [ -n "$(git -C "$REPO" status --porcelain -- "skills/$s" 2>/dev/null)" ]; then state="$commit+uncommitted"; fi
+
+  # Build next to the target (same filesystem, so the final mv is a rename), outside skills/.
+  tmp=$(mktemp -d "$CLAUDE_DIR/.skill-setup.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT
+  cp -R "$src/." "$tmp/"
+  rm -f "$tmp/install.conf"
+  grep -rlF '{{' "$tmp" | while IFS= read -r f; do
+    sed -e "s|{{SKILL_NAME}}|$(sed_text "$name")|g" \
+        -e "s|{{SKILL_DIR}}|$(sed_text "$(tilde "$dest")")|g" \
+        -e "s|{{SOURCE_DIR}}|$(sed_text "$(tilde "$src")")|g" "$f" > "$f.setup"
+    cat "$f.setup" > "$f" && rm "$f.setup" # cat keeps the file's mode
+  done || true
+  printf 'source=%s\ncommit=%s\nhash=%s\n' "$src" "$state" "$(hash_tree "$tmp")" > "$tmp/$MARKER"
+
+  if [ -d "$dest" ] && [ -f "$dest/$MARKER" ] && [ "$(marker_get "$dest" source)" = "$src" ] \
+    && [ "$(marker_get "$dest" hash)" = "$(marker_get "$tmp" hash)" ] && [ -z "$(blocker "$dest")" ]; then
+    rm -rf "$tmp"
+    say "unchanged  $(tilde "$dest")"
+  else
+    if [ -e "$dest" ]; then clear_path "$dest" "$(blocker "$dest")"; fi
+    mv "$tmp" "$dest"
+    say "installed  $(tilde "$dest")  ($s @ $state)"
+  fi
+  trap - EXIT
+  installed+=("$s")
+
+  # Switching prefix: drop the copy under the other name, but only one this setup made from this source.
+  if [ -e "$other" ]; then
+    if [ "$(marker_get "$other" source)" = "$src" ]; then
+      clear_path "$other" "$(blocker "$other")"
+      say "removed    $(tilde "$other") (now installed as $name)"
+    else
+      warn "$(tilde "$other") also exists and was not installed from here; Claude will see both. Left alone."
+    fi
+  fi
+
+  # Shims for `bin` entries.
+  while read -r kind bname script extra; do
+    [ "$kind" = bin ] || continue
+    [ -n "$script" ] && [ -z "$extra" ] || die "skills/$s/install.conf: bin needs exactly <name> <script>"
+    [ -f "$dest/$script" ] || die "skills/$s/install.conf: bin $bname: no $script in the skill"
+    shim="$BIN_DIR/$bname"
+    if [ -e "$shim" ] && ! grep -qF "$SHIM_TAG" "$shim"; then clear_path "$shim" "$(tilde "$shim") exists and was not written by this setup"; fi
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\n%s from %s\nexec bun "%s" "$@"\n' "$SHIM_TAG" "$(tilde "$src")" "$dest/$script" > "$shim"
+    chmod +x "$shim"
+    say "shim       $(tilde "$shim") -> $(tilde "$dest/$script")"
+    if command -v bun >/dev/null 2>&1 && ! "$shim" --help >/dev/null 2>&1; then warn "$bname --help failed; try running $(tilde "$shim") --help"; fi
+  done < <(conf "$s")
+done
+
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *) warn "$(tilde "$BIN_DIR") is not on PATH, so the shims won't be found. fish: fish_add_path $(tilde "$BIN_DIR"); bash/zsh: export PATH=\"$(tilde "$BIN_DIR"):\$PATH\"" ;;
+esac
+
+# ---------------------------------------------------------------- report
+
+required=() optional=()
+for i in ${missing[@]+"${missing[@]}"}; do
+  if [ "${d_req[i]}" = 1 ]; then required+=("$i"); else optional+=("$i"); fi
+done
+for i in ${optional[@]+"${optional[@]}"}; do say "optional, not installed: $(describe_dep "$i")"; done
+if [ ${#required[@]} -eq 0 ]; then
+  say "done: ${#installed[@]} skill(s), every required command present"
+  exit 0
+fi
+
+# Something required is still missing: hand it to Claude, with what it needs to know.
+. "$OS_RELEASE" 2>/dev/null || true
+os=${PRETTY_NAME:-}
+if [ "$KERNEL" = Darwin ]; then os="macOS $(sw_vers -productVersion 2>/dev/null || true)"; fi
+cat <<EOF
+
+The skills are installed, but some commands they need are missing.$([ $pm_ran = 1 ] && printf ' The package manager ran and they are still missing or too old; an older copy may come first on PATH.')
+Paste this into Claude Code:
+
+------------------------------------------------------------------------
+Install the commands my Claude Code skills need on this machine.
+
+Machine: ${os:-unknown OS} ($KERNEL $(uname -m))
+Package manager setup found: ${mgr:-none it knows}
+Skills repo: $(tilde "$REPO")
+
+Missing or too old:
+EOF
+for i in ${missing[@]+"${missing[@]}"}; do
+  printf -- '- %s' "$(describe_dep "$i")"
+  if [ -n "${d_arch[i]}${d_brew[i]}" ]; then printf ' [package: %s]' "$(printf '%s' "${d_arch[i]:+arch=${d_arch[i]} }${d_brew[i]:+brew=${d_brew[i]}}" | sed 's/ $//')"; fi
+  printf '\n'
+done
+cat <<EOF
+
+Use this system's usual package manager, or the tool's official installer where
+the package manager has no package or only an older version. Make sure each
+command is on PATH for new shells and that \`<command> --version\` meets the
+minimum. Then run $(tilde "$REPO")/setup again and confirm it ends with "done".
+------------------------------------------------------------------------
+EOF
+exit 2
