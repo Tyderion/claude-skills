@@ -45,6 +45,19 @@ function makeRemote(name: string) {
   return bare;
 }
 
+/** A fake gh at <dir>/gh: answers `pr list --head <b>` from $GH_FIXTURES/<b with / -> ->.json
+ *  (else "[]") and logs every call to $GH_LOG. */
+function writeFakeGh(dir: string) {
+  writeFileSync(join(dir, "gh"), [
+    "#!/bin/sh",
+    'echo "$@" >> "$GH_LOG"',
+    'while [ $# -gt 0 ]; do [ "$1" = --head ] && b=$2; shift; done',
+    'f="$GH_FIXTURES/$(printf %s "$b" | tr / -).json"',
+    'if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi',
+    "",
+  ].join("\n"), { mode: 0o755 });
+}
+
 beforeAll(() => { root = mkdtempSync(join(tmpdir(), "git-wt-test-")); });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
@@ -751,14 +764,7 @@ describe("reuse", () => {
     writeFileSync(join(c, ".shared"), ".env\n");
     expect(wt(c, "add", "feature/x").code).toBe(0);
     mkdirSync(join(ghDir(), "fixtures"), { recursive: true });
-    writeFileSync(join(ghDir(), "gh"), [
-      "#!/bin/sh",
-      'echo "$@" >> "$GH_LOG"',
-      'while [ $# -gt 0 ]; do [ "$1" = --head ] && b=$2; shift; done',
-      'f="$GH_FIXTURES/$(printf %s "$b" | tr / -).json"',
-      'if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi',
-      "",
-    ].join("\n"), { mode: 0o755 });
+    writeFakeGh(ghDir());
   });
 
   test("renames the folder, checks out a new branch from the fetched remote default, keeps ignored files", () => {
@@ -838,6 +844,8 @@ describe("reuse", () => {
       const r = wtGh(c, "add", "new/b");
       expect(r.code).toBe(0);
       expect(r.out).toContain("reusing done-a/: done/a was merged in t/reuse#7");
+      expect(r.out).toMatch(/deleted done\/a \(was [0-9a-f]{7,}; merged in t\/reuse#7\)/);
+      expect(sh("git", ["rev-parse", "--verify", "--quiet", "refs/heads/done/a"], c).code).not.toBe(0);
       expect(existsSync(join(c, "done-a"))).toBe(false);
       expect(git(join(c, "new-b"), "rev-parse", "HEAD")).toBe(git(c, "rev-parse", "origin/master"));
       expect(ghCalls()).toContain("--repo t/reuse --head done/a");
@@ -878,6 +886,32 @@ describe("reuse", () => {
       expect(existsSync(join(c, "fresh-g"))).toBe(true);
     });
 
+    test("explicit reuse deletes the old branch only when a merged PR contains it", () => {
+      expect(wtGh(c, "add", "ex/a", "--fresh").code).toBe(0);
+      const w = join(c, "ex-a");
+      writeFileSync(join(w, "ex.txt"), "e\n");
+      git(w, "add", "."); git(w, "commit", "-qm", "ex");
+      const tip = git(w, "rev-parse", "HEAD");
+      let r = wtGh(c, "reuse", "ex-a", "ex/b");
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("ex/a is still a local branch; nothing was deleted");
+      expect(git(c, "rev-parse", "ex/a")).toBe(tip);
+
+      merged("ex/b", git(join(c, "ex-b"), "rev-parse", "HEAD"), 8);
+      r = wtGh(c, "reuse", "ex-b", "ex/c");
+      expect(r.code).toBe(0);
+      expect(r.out).toMatch(/deleted ex\/b \(was [0-9a-f]{7,}; merged in t\/reuse#8\)/);
+      expect(sh("git", ["rev-parse", "--verify", "--quiet", "refs/heads/ex/b"], c).code).not.toBe(0);
+
+      // gh failing keeps the branch, and the reuse itself still goes through.
+      merged("ex/c", git(join(c, "ex-c"), "rev-parse", "HEAD"), 9);
+      r = sh("bun", [TOOL, "reuse", "ex-c", "ex/d"], c, { GIT_WT_GH: join(root, "no-such-gh") });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("cannot ask GitHub for merged PRs");
+      expect(r.out).toContain("ex/c is still a local branch");
+      expect(existsSync(join(c, "ex-d"))).toBe(true);
+    });
+
     test("a container without a GitHub remote never calls gh", () => {
       const local = join(root, "no-gh");
       expect(wt(root, "clone", makeRemote("no-gh-r"), "--dir", local).code).toBe(0);
@@ -916,14 +950,7 @@ describe("reuse safety", () => {
     git(c, "config", `url.${bare}.insteadOf`, url);
     git(c, "remote", "set-url", "origin", url);
     mkdirSync(gh());
-    writeFileSync(join(gh(), "gh"), [
-      "#!/bin/sh",
-      'echo "$@" >> "$GH_LOG"',
-      'while [ $# -gt 0 ]; do [ "$1" = --head ] && b=$2; shift; done',
-      'f="$GH_FIXTURES/$(printf %s "$b" | tr / -).json"',
-      'if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi',
-      "",
-    ].join("\n"), { mode: 0o755 });
+    writeFakeGh(gh());
     // Branches that track a normally ignored file, and the shared .env.
     onRemote((d) => {
       git(d, "checkout", "-qb", "tracks-ignored");
@@ -1014,5 +1041,178 @@ describe("reuse safety", () => {
     expect(githubRepo("https://notgithub.com/o/r.git")).toBeUndefined();
     expect(githubRepo("https://mygithub.com/o/r")).toBeUndefined();
     expect(githubRepo("git@github.company.com:o/r.git")).toBeUndefined();
+  });
+});
+
+describe("prune", () => {
+  let c: string;
+  let bare: string;
+  const gh = () => join(root, "gh3");
+  const ghEnv = () => ({ GIT_WT_GH: join(gh(), "gh"), GH_FIXTURES: gh(), GH_LOG: join(gh(), "calls") });
+  const wtGh = (...a: string[]) => sh("bun", [TOOL, ...a], c, ghEnv());
+  const merged = (branch: string, oid: string, n: number) =>
+    writeFileSync(join(gh(), `${branch.replace(/\//g, "-")}.json`), JSON.stringify([{ number: n, headRefOid: oid, mergedAt: "2026-10-01T00:00:00Z" }]));
+  const ghCalls = () => (existsSync(join(gh(), "calls")) ? readFileSync(join(gh(), "calls"), "utf8") : "");
+  const has = (b: string) => sh("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${b}`], c).code === 0;
+  const tips: Record<string, string> = {};
+  /** A branch with one commit of its own, made in a scratch worktree outside the container.
+   *  push: "u" pushes with an upstream, "plain" without one; `gone` then deletes it on the remote. */
+  function branch(name: string, push?: "u" | "plain", gone = false) {
+    const tmp = join(root, `prune-${name.replace(/\//g, "-")}`);
+    git(c, "worktree", "add", "-q", "--no-track", "-b", name, tmp, "origin/master");
+    writeFileSync(join(tmp, `${name.replace(/\//g, "-")}.txt`), "w\n");
+    git(tmp, "add", "."); git(tmp, "commit", "-qm", name);
+    if (push) git(tmp, "push", "-q", ...(push === "u" ? ["-u"] : []), "origin", name);
+    if (gone) git(tmp, "push", "-q", "origin", "--delete", name);
+    tips[name] = git(tmp, "rev-parse", "HEAD");
+    git(c, "worktree", "remove", tmp);
+  }
+
+  beforeAll(() => {
+    bare = makeRemote("prune-r");
+    c = join(root, "pruneproj");
+    expect(wt(root, "clone", bare, "--dir", c).code).toBe(0);
+    const url = "https://github.com/t/prune.git";
+    git(c, "config", `url.${bare}.insteadOf`, url);
+    git(c, "remote", "set-url", "origin", url);
+    git(c, "remote", "set-head", "origin", "master");
+    mkdirSync(gh());
+    writeFakeGh(gh());
+
+    branch("p/merged", "u", true); merged("p/merged", tips["p/merged"], 1);
+    branch("p/merged-live", "u"); merged("p/merged-live", tips["p/merged-live"], 2); // remote branch never deleted
+    branch("p/no-u", "plain", true); merged("p/no-u", tips["p/no-u"], 3); // pushed without -u
+    branch("p/desc", "u");
+    const remote = mkdtempSync(join(root, "prune-remote-"));
+    git(root, "clone", "-q", bare, remote);
+    git(remote, "checkout", "-q", "p/desc"); // a suggestion applied on GitHub, then the branch deleted
+    writeFileSync(join(remote, "desc.txt"), "suggested\n");
+    git(remote, "add", "."); git(remote, "commit", "-qm", "suggestion");
+    git(remote, "push", "-q", "origin", "HEAD:refs/pull/11/head");
+    git(remote, "push", "-q", "origin", "--delete", "p/desc");
+    merged("p/desc", git(remote, "rev-parse", "HEAD"), 11);
+    branch("p/gone", "u", true); // upstream gone, no PR
+    branch("p/local"); // never pushed
+    branch("p/open", "u"); // tracking, no PR
+    branch("p/open2", "u");
+    branch("p/past", "u"); merged("p/past", tips["p/past"], 4);
+    const past = join(root, "prune-past-more");
+    git(c, "worktree", "add", "-q", past, "p/past");
+    writeFileSync(join(past, "more.txt"), "after merge\n");
+    git(past, "add", "."); git(past, "commit", "-qm", "after merge");
+    git(c, "worktree", "remove", past);
+
+    expect(wtGh("add", "p/inwt", "--fresh").code).toBe(0);
+    merged("p/inwt", git(join(c, "p-inwt"), "rev-parse", "HEAD"), 5);
+    merged("master", git(c, "rev-parse", "master"), 6);
+    // A worktree whose folder is gone for now, say on an unmounted volume.
+    const vanished = join(root, "prune-vanished");
+    git(c, "worktree", "add", "-q", "--no-track", "-b", "p/vanished", vanished, "origin/master");
+    merged("p/vanished", git(vanished, "rev-parse", "HEAD"), 8);
+    rmSync(vanished, { recursive: true });
+    // A worktree stopped mid-rebase, which git lists as a detached HEAD.
+    const rb = join(root, "prune-rb");
+    git(c, "worktree", "add", "-q", "--detach", rb, "origin/master");
+    writeFileSync(join(rb, "a.txt"), "theirs\n");
+    git(rb, "commit", "-qam", "theirs");
+    const onto = git(rb, "rev-parse", "HEAD");
+    git(rb, "checkout", "-q", "--no-track", "-b", "p/rb", "origin/master");
+    writeFileSync(join(rb, "a.txt"), "ours\n");
+    git(rb, "commit", "-qam", "ours");
+    merged("p/rb", git(rb, "rev-parse", "HEAD"), 9);
+    expect(sh("git", ["rebase", onto], rb).code).not.toBe(0);
+    expect(git(rb, "rev-parse", "--abbrev-ref", "HEAD")).toBe("HEAD");
+
+    mkdirSync(join(c, "stray-empty", "a", "b"), { recursive: true });
+    mkdirSync(join(c, "stray-full", "tools"), { recursive: true });
+    writeFileSync(join(c, "stray-full", "tools", "outbox.jsonl"), "{}\n");
+    mkdirSync(join(c, "stray-link"));
+    symlinkSync("/nonexistent", join(c, "stray-link", "l"));
+    mkdirSync(join(c, "config"));
+    writeFileSync(join(c, "config", "local.yaml"), "k: v\n");
+    writeFileSync(join(c, ".shared"), "config/local.yaml\n");
+    mkdirSync(join(c, ".cache"));
+  });
+
+  test("without --yes it lists every group and changes nothing", () => {
+    writeFileSync(join(gh(), "calls"), "");
+    const r = wtGh("prune");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("merged, deleted by --yes (4):");
+    expect(r.out).toContain(`p/merged  ${tips["p/merged"].slice(0, 7)}`);
+    expect(r.out).toContain("t/prune#1");
+    for (const b of ["p/merged-live", "p/no-u", "p/desc"]) expect(r.out).toContain(`${b}  `);
+    expect(r.out).toMatch(/upstream gone but no merged PR found, deleted by --yes --gone \(1\):\n\s+p\/gone /);
+    expect(r.out).toMatch(/no upstream, kept \(1\):\n\s+p\/local /);
+    expect(r.out).toContain("kept: 3 tracking an existing remote branch, 3 checked out in a worktree");
+    expect(r.out).toContain("not a worktree, removed by --yes: stray-empty/ (empty)");
+    expect(r.out).toContain("not a worktree, left alone: stray-full/ holds 1 file");
+    expect(r.out).toContain("not a worktree, left alone: stray-link/ holds 1 file");
+    expect(r.out).not.toContain("config/");
+    expect(r.out).not.toContain(".cache");
+    expect(r.out).toContain("run again with --yes to delete 4 merged branches and 1 empty folder, and add --gone for the 1 upstream-gone one");
+    for (const b of [...Object.keys(tips), "p/inwt", "p/vanished", "p/rb", "master"]) expect(has(b)).toBe(true);
+    expect(existsSync(join(c, "stray-empty"))).toBe(true);
+    expect(git(c, "worktree", "list")).toContain("prune-vanished");
+    for (const b of ["master", "p/inwt", "p/vanished", "p/rb"]) expect(ghCalls()).not.toContain(`--head ${b} `);
+  });
+
+  test("--yes deletes the merged branches and empty folders only, printing each SHA", () => {
+    const r = wtGh("prune", "--yes");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`deleted p/merged (was ${tips["p/merged"].slice(0, 7)}`);
+    expect(r.out).toContain("merged in t/prune#1)");
+    for (const b of ["p/merged", "p/merged-live", "p/no-u", "p/desc"]) expect(has(b)).toBe(false);
+    for (const b of ["p/gone", "p/local", "p/open", "p/open2", "p/past", "p/inwt", "p/vanished", "p/rb", "master"]) expect(has(b)).toBe(true);
+    expect(r.out).toContain("kept without --gone");
+    expect(existsSync(join(c, "stray-empty"))).toBe(false);
+    expect(readFileSync(join(c, "stray-full", "tools", "outbox.jsonl"), "utf8")).toBe("{}\n");
+    expect(lstatSync(join(c, "stray-link", "l")).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(c, "config", "local.yaml"))).toBe(true);
+    expect(git(c, "worktree", "list")).toContain("prune-vanished");
+    // The printed SHA is enough to bring a branch back.
+    git(c, "branch", "p/merged", tips["p/merged"]);
+    expect(wtGh("prune", "--yes").out).toContain("deleted p/merged");
+  });
+
+  test("--gone also deletes upstream-gone branches, never local or checked-out ones", () => {
+    const r = wtGh("prune", "--yes", "--gone");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`deleted p/gone (was ${tips["p/gone"].slice(0, 7)}; upstream gone)`);
+    expect(has("p/gone")).toBe(false);
+    for (const b of ["p/local", "p/open", "p/past", "p/inwt", "p/vanished", "p/rb", "master"]) expect(has(b)).toBe(true);
+  });
+
+  test("a stale .bare/HEAD doesn't expose the remote's default branch", () => {
+    git(c, "symbolic-ref", "HEAD", "refs/heads/p/open");
+    try {
+      const r = wtGh("prune");
+      expect(r.code).toBe(0);
+      expect(r.out).not.toMatch(/^\s+master /m);
+      expect(r.out).not.toMatch(/^\s+p\/open /m);
+    } finally {
+      git(c, "symbolic-ref", "HEAD", "refs/heads/master");
+    }
+  });
+
+  test("when gh fails it warns and deletes nothing", () => {
+    branch("p/later", "u", true); merged("p/later", tips["p/later"], 7);
+    const r = sh("bun", [TOOL, "prune", "--yes"], c, { GIT_WT_GH: join(root, "no-such-gh") });
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("cannot ask GitHub for merged PRs");
+    expect(r.out).toContain("those branches count as not merged");
+    expect(r.err).not.toContain("    at ");
+    expect(has("p/later")).toBe(true);
+  });
+
+  test("rejects positional arguments", () => {
+    expect(wtGh("prune", "x").err).toContain("usage: git-wt prune");
+  });
+
+  test("reusing the default branch's worktree never deletes the default branch", () => {
+    const r = wtGh("reuse", "master", "p/newmain");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("master is still a local branch; nothing was deleted");
+    expect(has("master")).toBe(true);
   });
 });

@@ -1,7 +1,7 @@
 ---
 name: {{SKILL_NAME}}
 version: 1.0.0
-description: Bare-repo worktree containers via the git-wt CLI: clone into <container>/.bare + one folder per branch, convert a checkout in place, add a worktree per branch, reuse a merged worktree for a new branch (keeps node_modules), and share files like .env across worktrees. USE WHEN clone a repo, clone into coding, set up a repo, bare repo, .bare, git worktree, new worktree, work on two branches at once, reuse or recycle a worktree, avoid reinstalling dependencies, convert repo to worktrees, share .env across worktrees, git-wt. NOT FOR removing worktrees or general git history work.
+description: Bare-repo worktree containers via the git-wt CLI: clone into <container>/.bare + one folder per branch, convert a checkout in place, add a worktree per branch, reuse a merged worktree for a new branch (keeps node_modules), share files like .env across worktrees, and prune merged local branches (squash merges included). USE WHEN clone a repo, clone into coding, set up a repo, bare repo, .bare, git worktree, new worktree, work on two branches at once, reuse or recycle a worktree, avoid reinstalling dependencies, convert repo to worktrees, share .env across worktrees, prune branches, delete merged branches, clean up old branches, git-wt. NOT FOR removing worktrees or general git history work.
 ---
 
 # {{SKILL_NAME}}
@@ -25,6 +25,7 @@ Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/{{SKILL_NAME}}/PREFERENCES.md`
 | Share one file across worktrees (edits visible everywhere) | move it to the container root, list it under `[link]` in `<container>/.shared`, then `git-wt sync` |
 | Give each worktree its own editable copy of a default | put the default in the container root, list it under `[copy]`, then `git-wt sync` |
 | Throw away a worktree's edits to a copied file | `git-wt sync --reset <path>` (replaces every diverged copy with the root default) |
+| Clean up dead local branches | `git-wt prune` first and show the principal the list; only then `git-wt prune --yes`. Add `--gone` only when the principal asks to drop upstream-gone branches that have no merged PR |
 
 Base directory for `clone` defaults to `$GIT_WT_BASE`, else `~/coding`. Worktree folders are the branch name with `/` → `-` (`feature/x` → `feature-x/`).
 
@@ -54,8 +55,9 @@ User: "start on feature/y" (feature-x/'s PR is merged on GitHub)
 
 ## Gotchas
 
-- **Reuse keeps ignored files only, and never lets git overwrite one.** Tracked changes, untracked-but-not-ignored files, populated submodules, or a worktree outside the container folder make `reuse` refuse. So does a target branch that tracks a path sitting untracked in the worktree (an ignored file, a `[copy]` file, a shared link), which a plain checkout would silently replace. All refusals happen before anything changes; from `add`, a refusal falls back to a fresh worktree. The old local branch is never deleted.
+- **Reuse keeps ignored files only, and never lets git overwrite one.** Tracked changes, untracked-but-not-ignored files, populated submodules, or a worktree outside the container folder make `reuse` refuse. So does a target branch that tracks a path sitting untracked in the worktree (an ignored file, a `[copy]` file, a shared link), which a plain checkout would silently replace. All refusals happen before anything changes; from `add`, a refusal falls back to a fresh worktree. After a reuse, the old local branch is deleted only when a merged PR contains it (the auto-reuse rule below), with its SHA printed; otherwise it stays.
 - **Auto-reuse counts a worktree as merged only when a merged PR's head commit is its HEAD or descends from it.** Commits made after the merge disqualify it, and so does being the default branch's worktree. It asks `gh` about every github.com remote, so a fork's origin only finds PRs opened against the fork. A PR head that isn't local (a review suggestion applied on GitHub) is fetched from `refs/pull/<n>/head`. When `gh` is missing or fails, `add` says so and creates a fresh worktree.
+- **`prune` deletes by the same merged-PR rule, never by `git branch --merged`**, which squash merges defeat. Upstream gone (`[gone]`) only means the remote branch was deleted, possibly unmerged, so those branches are listed and deleted only with `--gone`, which can lose commits that were never pushed. Branches with no upstream, the default branch and branches checked out in a worktree (the reuse pool) are never deleted. Folders in the container that aren't worktrees are removed by `--yes` only when they hold no files; a removed worktree's folder often keeps files a running tool wrote after removal, so those are listed for the principal.
 - **Reuse fetches every remote and starts new branches from the remote's default branch**, unlike plain `add`, which starts from the local default. After a merge the local default is stale. A failed fetch is a warning; reuse carries on with local refs.
 
 - **Sync never overwrites a real file.** A real file where a shared link belongs aborts the whole sync with nothing changed. Resolving it (which copy wins, where it moves) is the principal's call; report the conflict and ask.
