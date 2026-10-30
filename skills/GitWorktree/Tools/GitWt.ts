@@ -11,7 +11,7 @@
  *
  * Subcommands: clone, convert, add, reuse, sync, prune, open. Run with --help for usage.
  */
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import {
   existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync,
   renameSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
@@ -68,12 +68,13 @@ const USAGE = `git-wt — bare-repo worktree containers
 
   git-wt open <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]
       Get <branch>'s worktree ready and print its path, alone, on stdout (the rest
-      goes to stderr). An existing worktree is used as it is. Otherwise the default
-      branch's worktree is pulled first (when it is dirty, the remote is fetched and
-      a new branch starts from <remote>/<default>), then add runs, reuse included.
-      Then: direnv allow when .envrc is the shared one, an install with the
-      lockfile's package manager for a new or reused worktree or one without
-      node_modules, and Claude Code's MCP approvals copied from the default
+      goes to stderr). An existing worktree is used as it is. Otherwise every remote
+      is fetched and the default branch's worktree fast-forwarded (when it is dirty,
+      it is left alone and a new branch starts from <remote>/<default>), then add
+      runs, reuse included. Then: direnv allow when .envrc is the shared one, an
+      install with the lockfile's package manager for a new or reused worktree, one
+      without node_modules, or one whose last install failed, and Claude Code's MCP
+      approvals copied from the default
       branch's worktree when the target has none. Tools/wtc.sh wraps it as wtc.
 `;
 
@@ -167,9 +168,15 @@ function worktrees(container: string): Worktree[] {
   return list;
 }
 
+/** The branch a symbolic ref points at, with `prefix` stripped, or undefined. Not `--short`, which
+ *  prints heads/<name> when a tag or other ref shares the name. */
+function symref(dir: string, ref: string, prefix = "refs/heads/"): string | undefined {
+  const r = gitTry(dir, "symbolic-ref", "--quiet", ref);
+  return r.ok && r.out.startsWith(prefix) ? r.out.slice(prefix.length) : undefined;
+}
+
 function defaultBranch(container: string): string {
-  const r = gitTry(container, "symbolic-ref", "--short", "HEAD");
-  return r.ok ? r.out : fail("cannot read the default branch from .bare/HEAD");
+  return symref(container, "HEAD") ?? fail("cannot read the default branch from .bare/HEAD");
 }
 
 // ---------------------------------------------------------------- sync
@@ -430,6 +437,10 @@ function planCheckout(container: string, branch: string, from?: string, remote?:
   return { opts: ["--no-track", "-b", branch], ref: start, note: `created new branch ${branch} from ${start}` };
 }
 
+/** A worktree's "dependencies still to install" marker, kept in its admin dir so it survives a move. */
+const installPending = (wt: string) => resolve(wt, git(wt, "rev-parse", "--git-path", "git-wt-install-pending"));
+const markInstallPending = (wt: string) => writeFileSync(installPending(wt), "");
+
 function folderFree(container: string, folder: string, branch: string) {
   if (!existsSync(folder)) return;
   const owner = worktrees(container).find((w) => w.path === folder);
@@ -438,7 +449,8 @@ function folderFree(container: string, folder: string, branch: string) {
     : `${folder} already exists${owner ? ` (worktree for ${owner.branch ?? "a detached HEAD"})` : ""}`);
 }
 
-export function add(container: string, branch: string, from?: string, remote?: string, fresh = false): string {
+/** `remoteDefault`: a new branch starts from <remote>/<default>, for callers that just fetched. */
+export function add(container: string, branch: string, from?: string, remote?: string, fresh = false, remoteDefault = false): string {
   const folder = join(container, flatten(branch));
   folderFree(container, folder, branch);
   git(container, "worktree", "prune");
@@ -448,15 +460,16 @@ export function add(container: string, branch: string, from?: string, remote?: s
       const name = basename(merged.wt.path);
       log(`reusing ${name}/: ${merged.wt.branch} was merged in ${merged.repo}#${merged.pr} (pass --fresh for a new worktree)`);
       try {
-        return reuse(container, merged.wt.path, branch, from, remote, merged);
+        return reuse(container, merged.wt.path, branch, from, remote);
       } catch (e) {
         if (!(e instanceof Refused)) throw e;
         log(`not reusing ${name}/ after all, nothing changed: ${e.message}`);
       }
     }
   }
-  const plan = planCheckout(container, branch, from, remote);
+  const plan = planCheckout(container, branch, from, remote, remoteDefault);
   git(container, "worktree", "add", ...plan.opts, folder, plan.ref);
+  markInstallPending(folder);
   if (plan.note) log(plan.note);
   reportSync(sync(container, { only: [folder] }));
   log(`worktree ${flatten(branch)}/ on ${branch}`);
@@ -511,8 +524,7 @@ function wouldOverwrite(dir: string, ref: string): string[] {
   return [...hits];
 }
 
-/** `merged` is the old branch's proof when the caller already has one; otherwise reuse asks gh. */
-export function reuse(container: string, which: string, branch: string, from?: string, remote?: string, merged?: Proof): string {
+export function reuse(container: string, which: string, branch: string, from?: string, remote?: string): string {
   const all = worktrees(container);
   const paths = [existsSync(which) ? realpathSync(which) : "", join(container, which), join(container, flatten(which))];
   const wt = all.find((w) => paths.includes(w.path)) ?? all.find((w) => w.branch === which)
@@ -537,6 +549,7 @@ export function reuse(container: string, which: string, branch: string, from?: s
   // Checkout before the move: it is the step that can still refuse (branch in use elsewhere),
   // and undoing it is one checkout.
   git(wt.path, "checkout", "--quiet", ...plan.opts, plan.ref);
+  markInstallPending(wt.path); // node_modules is the previous branch's
   if (folder !== wt.path) {
     try {
       inject("move");
@@ -557,7 +570,7 @@ export function reuse(container: string, which: string, branch: string, from?: s
     if (!(e instanceof Fail)) throw e;
     throw new Fail(`worktree ${basename(wt.path)}/ is now ${flatten(branch)}/ on ${branch}, but its shared files need attention:\n${e.message}`);
   }
-  if (wt.branch && wt.branch !== branch) dropReused(container, wt.branch, wt.head!, merged);
+  if (wt.branch && wt.branch !== branch) dropReused(container, wt.branch, wt.head!);
   log(`worktree ${basename(wt.path)}/ is now ${flatten(branch)}/ on ${branch}`);
   const cwd = process.cwd();
   if (cwd === wt.path || cwd.startsWith(wt.path + sep)) log(`your shell's directory moved; run: cd ${JSON.stringify(join(folder, relative(wt.path, cwd)))}`);
@@ -586,46 +599,42 @@ type GithubRemote = { repo: string; remote: string };
 /** A merged PR whose head commit is a branch's tip or descends from it. */
 type Proof = { repo: string; pr: number; mergedAt: string; base?: string };
 type Merged = Proof & { wt: Worktree };
-/** A merged PR of the branch that lacks `ahead` commits the branch made after it. */
-type Miss = { repo: string; pr: number; ahead: number };
+/** What gh says about a branch: the PR that proves it merged, why gh couldn't say, or the merged
+ *  PR that comes closest, missing `ahead` commits the branch made after it. */
+type Verdict = { proof?: Proof; error?: string; nearest?: { repo: string; pr: number; ahead: number } };
 /** gh's reply, shaped like spawnSync's result so the sync and async routes share one reader. */
 type GhReply = { error?: Error; status: number | null; stdout: string; stderr: string };
 
 const gh = () => process.env.GIT_WT_GH ?? "gh"; // tests point this at a fake
 const mergedPrsArgs = (repo: string, branch: string) =>
   ["pr", "list", "--repo", repo, "--head", branch, "--state", "merged", "--json", "number,headRefOid,mergedAt,baseRefName", "--limit", "20"];
-const askSync = (remotes: GithubRemote[], branch: string): [GithubRemote, GhReply][] =>
-  remotes.map((r) => [r, spawnSync(gh(), mergedPrsArgs(r.repo, branch), { encoding: "utf8" })]);
+const GH_TIMEOUT = 60_000;
+const ghSilent = () => new Error(`gh gave no answer within ${GH_TIMEOUT / 1000}s`);
+const askSync = (remotes: GithubRemote[], branch: string): [GithubRemote, GhReply][] => remotes.map((r) => {
+  const reply = spawnSync(gh(), mergedPrsArgs(r.repo, branch), { encoding: "utf8", timeout: GH_TIMEOUT });
+  return [r, (reply.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" ? { ...reply, error: ghSilent() } : reply];
+});
+const askAsync = (args: string[]): Promise<GhReply> => new Promise((done) =>
+  execFile(gh(), args, { timeout: GH_TIMEOUT }, (e, stdout, stderr) => {
+    // A non-zero exit puts its status in e.code; a failed spawn (ENOENT) or a kill puts none there.
+    const status = !e ? 0 : typeof e.code === "number" ? e.code : null;
+    const error = !e || status !== null ? undefined : e.killed ? ghSilent() : e;
+    done({ error, status, stdout, stderr });
+  }));
 
-function askAsync(args: string[], timeoutMs = 60_000): Promise<GhReply> {
-  return new Promise((done) => {
-    const p = spawn(gh(), args);
-    let stdout = "", stderr = "";
-    p.stdout.setEncoding("utf8").on("data", (d: string) => { stdout += d; });
-    p.stderr.setEncoding("utf8").on("data", (d: string) => { stderr += d; });
-    const timer = setTimeout(() => {
-      p.kill();
-      done({ error: new Error(`gh gave no answer within ${timeoutMs / 1000}s`), status: null, stdout, stderr });
-    }, timeoutMs);
-    p.on("error", (error) => { clearTimeout(timer); done({ error, status: null, stdout, stderr }); });
-    p.on("close", (status) => { clearTimeout(timer); done({ status, stdout, stderr }); });
-  });
-}
-
-/** The most recently merged PR that contains `branch` at `tip`, so commits made after the merge
- *  disqualify it; undefined when there is none, or why gh couldn't say. `replies` holds gh's
- *  answer from each GitHub remote. Merged PRs that miss commits made after them go to `misses`. */
-function mergedProof(container: string, branch: string, tip: string, replies: [GithubRemote, GhReply][], misses?: Miss[]): Proof | string | undefined {
+/** gh's `replies` (one per GitHub remote) about `branch` at `tip`, judged: the most recently merged
+ *  PR that contains the tip, so commits made after the merge disqualify it. */
+function mergedProof(container: string, branch: string, tip: string, replies: [GithubRemote, GhReply][]): Verdict {
   const known = (oid: string) => gitTry(container, "cat-file", "-e", `${oid}^{commit}`).ok;
-  let best: Proof | undefined;
+  const v: Verdict = {};
   for (const [{ repo, remote }, r] of replies) {
-    if (r.error || r.status !== 0) return `cannot ask GitHub for merged PRs (${r.error?.message ?? (r.stderr || r.stdout).trim()})`;
+    if (r.error || r.status !== 0) return { error: `cannot ask GitHub for merged PRs (${r.error?.message ?? (r.stderr || r.stdout).trim()})` };
     let prs: { number: number; headRefOid: string; mergedAt: string; baseRefName?: string }[];
     try {
       prs = JSON.parse(r.stdout);
       if (!Array.isArray(prs)) throw new Error("not a list");
     } catch (e) {
-      return `gh pr list gave unreadable output (${(e as Error).message})`;
+      return { error: `gh pr list gave unreadable output (${(e as Error).message})` };
     }
     for (const pr of prs) {
       // A head made on GitHub (an applied review suggestion) or pushed from elsewhere isn't local,
@@ -637,12 +646,15 @@ function mergedProof(container: string, branch: string, tip: string, replies: [G
           continue;
         }
       }
-      const contained = pr.headRefOid === tip || gitTry(container, "merge-base", "--is-ancestor", tip, pr.headRefOid).ok;
-      if (contained && (!best || pr.mergedAt > best.mergedAt)) best = { repo, pr: pr.number, mergedAt: pr.mergedAt, base: pr.baseRefName };
-      if (!contained) misses?.push({ repo, pr: pr.number, ahead: Number(gitTry(container, "rev-list", "--count", `${pr.headRefOid}..${tip}`).out) });
+      if (pr.headRefOid === tip || gitTry(container, "merge-base", "--is-ancestor", tip, pr.headRefOid).ok) {
+        if (!v.proof || pr.mergedAt > v.proof.mergedAt) v.proof = { repo, pr: pr.number, mergedAt: pr.mergedAt, base: pr.baseRefName };
+        continue;
+      }
+      const ahead = Number(git(container, "rev-list", "--count", `${pr.headRefOid}..${tip}`));
+      if (!v.nearest || ahead < v.nearest.ahead) v.nearest = { repo, pr: pr.number, ahead };
     }
   }
-  return best;
+  return v;
 }
 
 /** The clean worktree whose branch was merged most recently on GitHub (see mergedProof). The
@@ -654,25 +666,24 @@ function findMerged(container: string): Merged | undefined {
   const candidates = worktrees(container).filter((w) => w.branch && !defaults.has(w.branch) && w.head && !notReusable(container, w));
   let best: Merged | undefined;
   for (const wt of candidates) {
-    const p = mergedProof(container, wt.branch!, wt.head!, askSync(remotes, wt.branch!));
-    if (typeof p === "string") return void log(`warning: ${p}; not reusing a worktree`);
-    if (p && (!best || p.mergedAt > best.mergedAt)) best = { ...p, wt };
+    const { proof, error } = mergedProof(container, wt.branch!, wt.head!, askSync(remotes, wt.branch!));
+    if (error) return void log(`warning: ${error}; not reusing a worktree`);
+    if (proof && (!best || proof.mergedAt > best.mergedAt)) best = { ...proof, wt };
   }
   return best;
 }
 
 /** After a reuse, delete the worktree's old branch if a merged PR contains it; otherwise keep it. */
-function dropReused(container: string, branch: string, tip: string, known?: Proof) {
+function dropReused(container: string, branch: string, tip: string) {
   const kept = () => log(`${branch} is still a local branch; nothing was deleted`);
   // A release PR from master into production would otherwise count as proof.
   if (defaultBranches(container).has(branch)) return kept();
-  const remotes = githubRemotes(container);
-  const p = known ?? (remotes.length ? mergedProof(container, branch, tip, askSync(remotes, branch)) : undefined);
-  if (typeof p === "string") log(`warning: ${p}`);
-  if (!p || typeof p === "string") return kept();
+  const { proof, error } = mergedProof(container, branch, tip, askSync(githubRemotes(container), branch));
+  if (error) log(`warning: ${error}`);
+  if (!proof) return kept();
   const del = gitTry(container, "branch", "-D", branch);
-  if (!del.ok) return log(`warning: ${branch} was merged in ${prRef(p)} but could not be deleted: ${del.err.trim()}`);
-  log(`deleted ${branch} (was ${git(container, "rev-parse", "--short", tip)}; merged in ${prRef(p)})`);
+  if (!del.ok) return log(`warning: ${branch} was merged in ${prRef(proof)} but could not be deleted: ${del.err.trim()}`);
+  log(`deleted ${branch} (was ${git(container, "rev-parse", "--short", tip)}; merged in ${prRef(proof)})`);
 }
 
 const prRef = (p: Proof) => `${p.repo}#${p.pr}${p.base ? ` into ${p.base}` : ""}`;
@@ -681,11 +692,10 @@ const prRef = (p: Proof) => `${p.repo}#${p.pr}${p.base ? ` into ${p.base}` : ""}
  *  right when .bare/HEAD doesn't (after convert on a feature branch, or a default renamed on GitHub). */
 function defaultBranches(container: string): Map<string, string> {
   const map = new Map<string, string>();
-  const head = gitTry(container, "symbolic-ref", "--short", "HEAD");
-  if (head.ok) map.set(head.out, "default branch");
+  const head = symref(container, "HEAD");
+  if (head) map.set(head, "default branch");
   for (const r of git(container, "remote").split("\n").filter(Boolean)) {
-    const t = gitTry(container, "symbolic-ref", "--short", `refs/remotes/${r}/HEAD`);
-    const b = t.ok && t.out.startsWith(`${r}/`) ? t.out.slice(r.length + 1) : "";
+    const b = symref(container, `refs/remotes/${r}/HEAD`, `refs/remotes/${r}/`);
     if (b && !map.has(b)) map.set(b, `default branch of ${r}`);
   }
   return map;
@@ -734,8 +744,7 @@ async function mapLimit<T, R>(items: T[], width: number, fn: (item: T) => Promis
   return out;
 }
 
-const countFiles = (dir: string): number =>
-  readdirSync(dir, { withFileTypes: true }).reduce((n, e) => n + (e.isDirectory() ? countFiles(join(dir, e.name)) : 1), 0);
+const countFiles = (dir: string) => readdirSync(dir, { recursive: true, withFileTypes: true }).filter((e) => !e.isDirectory()).length;
 /** Remove a tree of empty folders bottom-up. rmdir refuses a folder holding anything, so a file
  *  written since it was counted stops the removal instead of being lost. */
 const removeEmpty = (dir: string): void => {
@@ -763,33 +772,26 @@ export async function prune(container: string, { yes = false, gone = false } = {
   // One gh call per branch and remote, ~0.5s each; a backlog of 100 branches would take a minute in a row.
   const replies = await mapLimit(candidates, 8, (b) =>
     Promise.all(remotes.map(async (r): Promise<[GithubRemote, GhReply]> => [r, await askAsync(mergedPrsArgs(r.repo, b.name))])));
-  const misses: Miss[][] = candidates.map(() => []);
-  const proofs = candidates.map((b, i) => mergedProof(container, b.name, b.tip, replies[i], misses[i]));
-  const errors = proofs.filter((p) => typeof p === "string");
+  const verdicts = new Map(candidates.map((b, i) => [b.name, mergedProof(container, b.name, b.tip, replies[i])]));
+  const errors = [...verdicts.values()].flatMap((v) => v.error ?? []);
   if (errors.length) log(`warning: ${errors[0]}${errors.length > 1 ? `, and ${errors.length - 1} more like it` : ""}; those branches count as not merged`);
 
   // Every branch lands in exactly one list, with the reason that put it there.
-  const merged: [Branch, Proof][] = [];
+  const merged: [Branch, string][] = [];
   const goneOnly: [Branch, string][] = [];
   const kept: [Branch, string][] = [];
-  const index = new Map(candidates.map((b, i) => [b.name, i]));
   for (const b of branches) {
-    const i = index.get(b.name);
-    if (i === undefined) {
-      kept.push([b, defaults.get(b.name) ?? busy.get(b.name)!]);
-      continue;
+    const v = verdicts.get(b.name);
+    if (!v) kept.push([b, defaults.get(b.name) ?? busy.get(b.name)!]);
+    else if (v.proof) merged.push([b, `merged in ${prRef(v.proof)}`]);
+    else {
+      const n = v.nearest;
+      const unmerged = v.error ? "GitHub not asked (see warning)"
+        : n ? `${n.repo}#${n.pr} merged, but ${n.ahead} commit${n.ahead === 1 ? "" : "s"} came after it`
+        : "no merged PR";
+      if (b.gone) goneOnly.push([b, `upstream gone, ${unmerged}`]);
+      else kept.push([b, `${b.upstream ? `tracking ${b.upstream.replace(/^refs\/remotes\//, "")}` : "no upstream"}, ${unmerged}`]);
     }
-    const p = proofs[i];
-    if (p && typeof p !== "string") {
-      merged.push([b, p]);
-      continue;
-    }
-    const miss = misses[i].sort((x, y) => x.ahead - y.ahead)[0];
-    const unmerged = p ? "GitHub not asked (see warning)"
-      : miss ? `${miss.repo}#${miss.pr} merged, but ${miss.ahead} commit${miss.ahead === 1 ? "" : "s"} came after it`
-      : "no merged PR";
-    if (b.gone) goneOnly.push([b, `upstream gone, ${unmerged}`]);
-    else kept.push([b, `${b.upstream ? `tracking ${b.upstream.replace(/^refs\/remotes\//, "")}` : "no upstream"}, ${unmerged}`]);
   }
 
   const failed: string[] = [];
@@ -807,8 +809,8 @@ export async function prune(container: string, { yes = false, gone = false } = {
     if (rows.length) log(`${title} (${rows.length}):\n${rows.map(([b, why]) => `  ${b.name.padEnd(width)}  ${b.short}  ${why}`).join("\n")}`);
   };
 
-  if (yes) for (const [b, p] of merged) drop(b, `merged in ${prRef(p)}`);
-  else list("deleted by --yes", merged.map(([b, p]) => [b, `merged in ${prRef(p)}`]));
+  if (yes) for (const [b, why] of merged) drop(b, why);
+  else list("deleted by --yes", merged);
   if (yes && gone) for (const [b, why] of goneOnly) drop(b, why);
   else list(yes ? "kept without --gone" : "deleted by --yes --gone", goneOnly);
   list("kept", kept);
@@ -817,14 +819,14 @@ export async function prune(container: string, { yes = false, gone = false } = {
   // the folder after removal. Empty ones go; anything with files is left for a person to look at.
   const roots = new Set([...link, ...copy].map((p) => p.split(sep)[0]));
   const treePaths = new Set(worktrees(container).map((w) => w.path));
-  let empty = 0;
+  let emptyFound = false;
   for (const e of readdirSync(container, { withFileTypes: true })) {
     const dir = join(container, e.name);
     if (!e.isDirectory() || e.name.startsWith(".") || roots.has(e.name) || treePaths.has(dir)) continue;
     const files = countFiles(dir);
     if (files) log(`not a worktree, left alone: ${e.name}/ holds ${files} file${files === 1 ? "" : "s"}`);
     else if (!yes) {
-      empty++;
+      emptyFound = true;
       log(`not a worktree, removed by --yes: ${e.name}/ (empty)`);
     } else {
       try {
@@ -838,12 +840,7 @@ export async function prune(container: string, { yes = false, gone = false } = {
 
   if (failed.length) fail(`could not delete:\n  ${failed.join("\n  ")}`);
   if (yes) return;
-  const would = [
-    merged.length && `${merged.length} merged branch${merged.length === 1 ? "" : "es"}`,
-    empty && `${empty} empty folder${empty === 1 ? "" : "s"}`,
-  ].filter(Boolean);
-  if (would.length) log(`nothing changed; run again with --yes to delete ${would.join(" and ")}${goneOnly.length ? `, and add --gone for the ${goneOnly.length} upstream-gone one${goneOnly.length === 1 ? "" : "s"}` : ""}`);
-  else if (goneOnly.length) log(`nothing changed; --yes --gone deletes the ${goneOnly.length} upstream-gone branch${goneOnly.length === 1 ? "" : "es"}`);
+  if (merged.length || goneOnly.length || emptyFound) log("nothing changed; the lists above say what --yes and --yes --gone delete");
 }
 
 // ---------------------------------------------------------------- open
@@ -854,7 +851,6 @@ function runAside(cmd: string, args: string[], cwd: string) {
   if (r.error) fail(`${cmd}: ${r.error.message}`);
   if (r.status !== 0) fail(`${cmd} ${args.join(" ")} failed in ${cwd} (exit ${r.status})`);
 }
-const onPath = (cmd: string) => !spawnSync(cmd, ["--version"], { stdio: "ignore" }).error;
 const sameFile = (a: string, b: string) => existsSync(a) && existsSync(b) && realpathSync(a) === realpathSync(b);
 
 const LOCKFILES: [string, string][] = [["yarn.lock", "yarn"], ["pnpm-lock.yaml", "pnpm"], ["bun.lock", "bun"], ["bun.lockb", "bun"], ["package-lock.json", "npm"]];
@@ -864,7 +860,7 @@ const LOCKFILES: [string, string][] = [["yarn.lock", "yarn"], ["pnpm-lock.yaml",
 function inheritMcpDecisions(from: string, to: string) {
   const src = join(from, ".claude", "settings.local.json");
   const dst = join(to, ".claude", "settings.local.json");
-  if (!existsSync(src) || sameFile(src, dst)) return;
+  if (!existsSync(src)) return;
   const readJson = (p: string) => {
     try { return JSON.parse(readFileSync(p, "utf8")); } catch (e) { return fail(`${p}: ${(e as Error).message}`); }
   };
@@ -885,35 +881,30 @@ function inheritMcpDecisions(from: string, to: string) {
  *  dependencies installed, its MCP approvals inherited. Returns its path; logs go to stderr. */
 export function open(container: string, branch: string, opts: { from?: string; remote?: string; fresh?: boolean } = {}): string {
   const all = worktrees(container);
-  const od = gitTry(container, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
-  const def = od.ok ? od.out.replace(/^origin\//, "") : defaultBranch(container);
+  const def = defaultBranch(container);
   const defWt = all.find((w) => w.branch === def)?.path;
   let wt = all.find((w) => w.branch === branch)?.path;
-  const created = !wt;
   if (!wt) {
-    let from = opts.from;
-    // A new branch should start from the remote's latest default, not a stale local one.
-    if (defWt && git(defWt, "status", "--porcelain") === "") {
-      runAside("git", ["pull", "--ff-only"], defWt);
-    } else {
-      const remotes = git(container, "remote").split("\n").filter(Boolean);
-      const remote = remotes.includes("origin") ? "origin" : remotes[0];
-      if (remote) {
-        runAside("git", ["fetch", remote], container);
-        const has = (ref: string) => gitTry(container, "rev-parse", "--verify", "--quiet", ref).ok;
-        const exists = has(`refs/heads/${branch}`) || remotes.some((r) => has(`refs/remotes/${r}/${branch}`));
-        if (!from && !opts.remote && !exists && has(`refs/remotes/${remote}/${def}`)) from = `${remote}/${def}`;
-      }
-    }
-    wt = add(container, branch, from, opts.remote, opts.fresh);
+    // Fetch every remote, so a branch that only another remote has gets tracked. A new branch should
+    // start from the latest default: fast-forward a clean default worktree that has an upstream, or
+    // else leave it alone and start from the remote's default.
+    runAside("git", ["fetch", "--all"], container);
+    const ff = defWt !== undefined && git(defWt, "status", "--porcelain") === "" && gitTry(defWt, "rev-parse", "--abbrev-ref", "@{u}").ok;
+    if (ff) runAside("git", ["merge", "--ff-only", "@{u}"], defWt);
+    wt = add(container, branch, opts.from, opts.remote, opts.fresh, !ff);
   }
 
   const envrc = join(wt, ".envrc");
-  if (sameFile(envrc, join(container, ".envrc")) && onPath("direnv")) runAside("direnv", ["allow", wt], wt);
-  // A reused worktree keeps the previous branch's node_modules, so it installs too.
-  if (created || !existsSync(join(wt, "node_modules"))) {
+  if (sameFile(envrc, join(container, ".envrc")) && Bun.which("direnv")) runAside("direnv", ["allow", wt], wt);
+  // add and reuse leave the marker; an install that fails or is cut short keeps it, so this retries.
+  const pending = installPending(wt);
+  if (existsSync(pending) || !existsSync(join(wt, "node_modules"))) {
     const pm = LOCKFILES.find(([file]) => existsSync(join(wt!, file)));
-    if (pm) runAside(pm[1], ["install"], wt);
+    if (pm) {
+      writeFileSync(pending, "");
+      runAside(pm[1], ["install"], wt);
+    }
+    rmSync(pending, { force: true });
   }
   if (defWt) inheritMcpDecisions(defWt, wt);
   return wt;
@@ -953,9 +944,7 @@ export function convert(path: string): string {
     if (existsSync(join(gitDir, f))) fail(`an operation is in progress (${f}); finish or abort it first`);
   }
   if (git(top, "status", "--porcelain", "--untracked-files=no")) fail(`uncommitted changes to tracked files; commit or stash them first`);
-  const branchR = gitTry(top, "symbolic-ref", "--short", "HEAD");
-  if (!branchR.ok) fail("HEAD is detached; check out a branch first");
-  const branch = branchR.out;
+  const branch = symref(top, "HEAD") ?? fail("HEAD is detached; check out a branch first");
   const stashes = git(top, "stash", "list", "--format=%H %gs");
   const head = git(top, "rev-parse", "HEAD");
 
@@ -1082,9 +1071,9 @@ export function convert(path: string): string {
   rmSync(journal, { force: true });
 
   // .bare/HEAD still names the branch that was checked out; point it at the remote's default.
-  const originHead = gitTry(top, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
+  const originHead = symref(top, "refs/remotes/origin/HEAD", "refs/remotes/origin/");
   // No reflog: the bare HEAD log was just grafted into the worktree and should stay gone.
-  if (originHead.ok) git(top, "-c", "core.logAllRefUpdates=false", "symbolic-ref", "HEAD", `refs/heads/${originHead.out.replace(/^origin\//, "")}`);
+  if (originHead) git(top, "-c", "core.logAllRefUpdates=false", "symbolic-ref", "HEAD", `refs/heads/${originHead}`);
   else log(`note: origin/HEAD is unknown, so new branches will start from ${branch}; run git remote set-head origin --auto to fix`);
 
   if (coreWorktree !== undefined) log(`removed core.worktree=${coreWorktree} (redundant, and it conflicts with core.bare)`);
@@ -1189,6 +1178,7 @@ function main(argv: string[]) {
     fail(`${cmd}: ${(e as Error).message}`);
   }
   const { values, positionals: pos } = parsed!;
+  if (cmd === "open") log = (msg) => console.error(msg); // stdout is the path alone, even for --help
   if (values.help) return log(USAGE);
   const flags = values as Record<string, string | undefined>;
   switch (cmd) {
@@ -1212,7 +1202,6 @@ function main(argv: string[]) {
       return prune(findContainer(flags.C ?? process.cwd()), { yes: Boolean(values.yes), gone: Boolean(values.gone) });
     case "open": {
       if (pos.length !== 1) fail("usage: git-wt open <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]");
-      log = (msg) => console.error(msg);
       return void console.log(open(findContainer(flags.C ?? process.cwd()), pos[0], { from: flags.from, remote: flags.remote, fresh: Boolean(values.fresh) }));
     }
   }

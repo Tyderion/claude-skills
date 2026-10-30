@@ -45,9 +45,10 @@ function makeRemote(name: string) {
   return bare;
 }
 
-/** A fake gh at <dir>/gh: answers `pr list --head <b>` from $GH_FIXTURES/<b with / -> ->.json
- *  (else "[]") and logs every call to $GH_LOG. */
-function writeFakeGh(dir: string) {
+/** A fake gh at <dir>/gh: answers `pr list --head <b>` from <dir>/<b with / -> ->.json (else "[]")
+ *  and logs every call to <dir>/calls. */
+function fakeGh(dir: string) {
+  mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "gh"), [
     "#!/bin/sh",
     'echo "$@" >> "$GH_LOG"',
@@ -56,7 +57,19 @@ function writeFakeGh(dir: string) {
     'if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi',
     "",
   ].join("\n"), { mode: 0o755 });
+  const calls = join(dir, "calls");
+  const fixture = (branch: string) => join(dir, `${branch.replace(/\//g, "-")}.json`);
+  return {
+    env: { GIT_WT_GH: join(dir, "gh"), GH_FIXTURES: dir, GH_LOG: calls },
+    fixture,
+    merged: (branch: string, oid: string, n = 7, at = "2026-10-01T00:00:00Z") =>
+      writeFileSync(fixture(branch), JSON.stringify([{ number: n, headRefOid: oid, mergedAt: at }])),
+    unmerge: (branch: string) => rmSync(fixture(branch), { force: true }),
+    calls: () => (existsSync(calls) ? readFileSync(calls, "utf8") : ""),
+    clearCalls: () => writeFileSync(calls, ""),
+  };
 }
+type FakeGh = ReturnType<typeof fakeGh>;
 
 beforeAll(() => { root = mkdtempSync(join(tmpdir(), "git-wt-test-")); });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -738,14 +751,9 @@ describe("convert", () => {
 describe("reuse", () => {
   let c: string;
   let bare: string;
-  const ghDir = () => join(root, "gh");
-  const fixtures = () => join(ghDir(), "fixtures");
+  let g: FakeGh;
   /** A fake gh: answers `pr list --head <b>` from fixtures/<b with / -> ->.json, logs every call. */
-  const ghEnv = () => ({ GIT_WT_GH: join(ghDir(), "gh"), GH_FIXTURES: fixtures(), GH_LOG: join(ghDir(), "calls") });
-  const wtGh = (cwd: string, ...a: string[]) => sh("bun", [TOOL, ...a], cwd, ghEnv());
-  const merged = (branch: string, oid: string, n = 7, at = "2026-10-01T00:00:00Z") =>
-    writeFileSync(join(fixtures(), `${branch.replace(/\//g, "-")}.json`), JSON.stringify([{ number: n, headRefOid: oid, mergedAt: at }]));
-  const ghCalls = () => (existsSync(join(ghDir(), "calls")) ? readFileSync(join(ghDir(), "calls"), "utf8") : "");
+  const wtGh = (cwd: string, ...a: string[]) => sh("bun", [TOOL, ...a], cwd, g.env);
   /** Push a commit to the remote's master, so local master is stale until a fetch. */
   function advanceRemote(): string {
     const tmp = mkdtempSync(join(root, "push-"));
@@ -763,8 +771,7 @@ describe("reuse", () => {
     writeFileSync(join(c, ".env"), "S=1\n");
     writeFileSync(join(c, ".shared"), ".env\n");
     expect(wt(c, "add", "feature/x").code).toBe(0);
-    mkdirSync(join(ghDir(), "fixtures"), { recursive: true });
-    writeFakeGh(ghDir());
+    g = fakeGh(join(root, "gh"));
   });
 
   test("renames the folder, checks out a new branch from the fetched remote default, keeps ignored files", () => {
@@ -840,7 +847,7 @@ describe("reuse", () => {
       expect(wt(c, "add", "done/a").code).toBe(0);
       writeFileSync(join(c, "done-a", "work.txt"), "w\n");
       git(join(c, "done-a"), "add", "."); git(join(c, "done-a"), "commit", "-qm", "work");
-      merged("done/a", git(join(c, "done-a"), "rev-parse", "HEAD"));
+      g.merged("done/a", git(join(c, "done-a"), "rev-parse", "HEAD"));
       const r = wtGh(c, "add", "new/b");
       expect(r.code).toBe(0);
       expect(r.out).toContain("reusing done-a/: done/a was merged in t/reuse#7");
@@ -848,31 +855,31 @@ describe("reuse", () => {
       expect(sh("git", ["rev-parse", "--verify", "--quiet", "refs/heads/done/a"], c).code).not.toBe(0);
       expect(existsSync(join(c, "done-a"))).toBe(false);
       expect(git(join(c, "new-b"), "rev-parse", "HEAD")).toBe(git(c, "rev-parse", "origin/master"));
-      expect(ghCalls()).toContain("--repo t/reuse --head done/a");
+      expect(g.calls()).toContain("--repo t/reuse --head done/a");
     });
 
     test("never the default branch, never with commits past the merged head, never with --fresh", () => {
-      merged("master", git(c, "rev-parse", "master"));
+      g.merged("master", git(c, "rev-parse", "master"));
       expect(wt(c, "add", "past/c").code).toBe(0);
       const before = git(join(c, "past-c"), "rev-parse", "HEAD");
       writeFileSync(join(c, "past-c", "more.txt"), "m\n");
       git(join(c, "past-c"), "add", "."); git(join(c, "past-c"), "commit", "-qm", "after merge");
-      merged("past/c", before);
-      writeFileSync(join(ghDir(), "calls"), "");
+      g.merged("past/c", before);
+      g.clearCalls();
       // new/b's branch has no PR; moved and the rest likewise.
       const r = wtGh(c, "add", "fresh/d");
       expect(r.code).toBe(0);
       expect(r.out).not.toContain("reusing");
       expect(existsSync(join(c, "fresh-d"))).toBe(true);
       expect(existsSync(join(c, "past-c"))).toBe(true);
-      expect(ghCalls()).not.toContain("--head master");
+      expect(g.calls()).not.toContain("--head master");
 
-      merged("fresh/d", git(join(c, "fresh-d"), "rev-parse", "HEAD"));
-      writeFileSync(join(ghDir(), "calls"), "");
+      g.merged("fresh/d", git(join(c, "fresh-d"), "rev-parse", "HEAD"));
+      g.clearCalls();
       const f = wtGh(c, "add", "fresh/e", "--fresh");
       expect(f.out).not.toContain("reusing");
       expect(existsSync(join(c, "fresh-d"))).toBe(true);
-      expect(ghCalls()).toBe("");
+      expect(g.calls()).toBe("");
     });
 
     test("a dirty merged worktree is skipped; a missing gh is announced and add goes ahead", () => {
@@ -897,14 +904,14 @@ describe("reuse", () => {
       expect(r.out).toContain("ex/a is still a local branch; nothing was deleted");
       expect(git(c, "rev-parse", "ex/a")).toBe(tip);
 
-      merged("ex/b", git(join(c, "ex-b"), "rev-parse", "HEAD"), 8);
+      g.merged("ex/b", git(join(c, "ex-b"), "rev-parse", "HEAD"), 8);
       r = wtGh(c, "reuse", "ex-b", "ex/c");
       expect(r.code).toBe(0);
       expect(r.out).toMatch(/deleted ex\/b \(was [0-9a-f]{7,}; merged in t\/reuse#8\)/);
       expect(sh("git", ["rev-parse", "--verify", "--quiet", "refs/heads/ex/b"], c).code).not.toBe(0);
 
       // gh failing keeps the branch, and the reuse itself still goes through.
-      merged("ex/c", git(join(c, "ex-c"), "rev-parse", "HEAD"), 9);
+      g.merged("ex/c", git(join(c, "ex-c"), "rev-parse", "HEAD"), 9);
       r = sh("bun", [TOOL, "reuse", "ex-c", "ex/d"], c, { GIT_WT_GH: join(root, "no-such-gh") });
       expect(r.code).toBe(0);
       expect(r.out).toContain("cannot ask GitHub for merged PRs");
@@ -916,9 +923,9 @@ describe("reuse", () => {
       const local = join(root, "no-gh");
       expect(wt(root, "clone", makeRemote("no-gh-r"), "--dir", local).code).toBe(0);
       expect(wt(local, "add", "feature/x").code).toBe(0);
-      writeFileSync(join(ghDir(), "calls"), "");
+      g.clearCalls();
       expect(wtGh(local, "add", "no-gh").code).toBe(0);
-      expect(ghCalls()).toBe("");
+      expect(g.calls()).toBe("");
     });
   });
 });
@@ -926,12 +933,8 @@ describe("reuse", () => {
 describe("reuse safety", () => {
   let c: string;
   let bare: string;
-  const gh = () => join(root, "gh2");
-  const ghEnv = () => ({ GIT_WT_GH: join(gh(), "gh"), GH_FIXTURES: gh(), GH_LOG: join(gh(), "calls") });
-  const wtGh = (cwd: string, ...a: string[]) => sh("bun", [TOOL, ...a], cwd, ghEnv());
-  const merged = (branch: string, oid: string, n = 7) =>
-    writeFileSync(join(gh(), `${branch.replace(/\//g, "-")}.json`), JSON.stringify([{ number: n, headRefOid: oid, mergedAt: "2026-10-01T00:00:00Z" }]));
-  const unmerge = (branch: string) => rmSync(join(gh(), `${branch.replace(/\//g, "-")}.json`), { force: true });
+  let g: FakeGh;
+  const wtGh = (cwd: string, ...a: string[]) => sh("bun", [TOOL, ...a], cwd, g.env);
   /** Run `fn` in a scratch clone of the remote, which it may commit in and push from. */
   function onRemote(fn: (dir: string) => void) {
     const tmp = mkdtempSync(join(root, "remote-work-"));
@@ -949,8 +952,7 @@ describe("reuse safety", () => {
     const url = "https://github.com/t/safe.git";
     git(c, "config", `url.${bare}.insteadOf`, url);
     git(c, "remote", "set-url", "origin", url);
-    mkdirSync(gh());
-    writeFakeGh(gh());
+    g = fakeGh(join(root, "gh2"));
     // Branches that track a normally ignored file, and the shared .env.
     onRemote((d) => {
       git(d, "checkout", "-qb", "tracks-ignored");
@@ -980,13 +982,13 @@ describe("reuse safety", () => {
   });
 
   test("add falls back to a fresh worktree when the merged candidate refuses", () => {
-    merged("clob/a", git(join(c, "clob-a"), "rev-parse", "HEAD"));
+    g.merged("clob/a", git(join(c, "clob-a"), "rev-parse", "HEAD"));
     const r = wtGh(c, "add", "tracks-ignored");
     expect(r.code).toBe(0);
     expect(r.out).toContain("not reusing clob-a/ after all, nothing changed");
     expect(readFileSync(join(c, "clob-a", "build", "keep.txt"), "utf8")).toBe("MINE\n");
     expect(readFileSync(join(c, "tracks-ignored", "build", "keep.txt"), "utf8")).toBe("FROM BRANCH\n");
-    unmerge("clob/a");
+    g.unmerge("clob/a");
   });
 
   test("refuses worktrees outside the container and ones with populated submodules", () => {
@@ -1017,7 +1019,7 @@ describe("reuse safety", () => {
       git(d, "push", "-q", "origin", "HEAD:refs/pull/9/head");
     });
     expect(sh("git", ["cat-file", "-e", head], c).code).not.toBe(0);
-    merged("done/m", head, 9);
+    g.merged("done/m", head, 9);
     const r = wtGh(c, "add", "next/m");
     expect(r.code).toBe(0);
     expect(r.out).toContain("reusing done-m/: done/m was merged in t/safe#9");
@@ -1025,12 +1027,12 @@ describe("reuse safety", () => {
   });
 
   test("unreadable gh output is a warning, not a crash", () => {
-    writeFileSync(join(gh(), "tracks-ignored.json"), "not json");
+    writeFileSync(g.fixture("tracks-ignored"), "not json");
     const r = wtGh(c, "add", "after-junk");
     expect(r.code).toBe(0);
     expect(r.out).toContain("unreadable output");
     expect(r.err).not.toContain("    at ");
-    unmerge("tracks-ignored");
+    g.unmerge("tracks-ignored");
   });
 
   test("githubRepo matches github.com only", async () => {
@@ -1047,12 +1049,8 @@ describe("reuse safety", () => {
 describe("prune", () => {
   let c: string;
   let bare: string;
-  const gh = () => join(root, "gh3");
-  const ghEnv = () => ({ GIT_WT_GH: join(gh(), "gh"), GH_FIXTURES: gh(), GH_LOG: join(gh(), "calls") });
-  const wtGh = (...a: string[]) => sh("bun", [TOOL, ...a], c, ghEnv());
-  const merged = (branch: string, oid: string, n: number) =>
-    writeFileSync(join(gh(), `${branch.replace(/\//g, "-")}.json`), JSON.stringify([{ number: n, headRefOid: oid, mergedAt: "2026-10-01T00:00:00Z" }]));
-  const ghCalls = () => (existsSync(join(gh(), "calls")) ? readFileSync(join(gh(), "calls"), "utf8") : "");
+  let g: FakeGh;
+  const wtGh = (...a: string[]) => sh("bun", [TOOL, ...a], c, g.env);
   /** The section, short SHA and reason prune printed for each branch. */
   const rows = (out: string) => {
     const m = new Map<string, { section: string; sha: string; why: string }>();
@@ -1088,12 +1086,11 @@ describe("prune", () => {
     git(c, "config", `url.${bare}.insteadOf`, url);
     git(c, "remote", "set-url", "origin", url);
     git(c, "remote", "set-head", "origin", "master");
-    mkdirSync(gh());
-    writeFakeGh(gh());
+    g = fakeGh(join(root, "gh3"));
 
-    branch("p/merged", "u", true); merged("p/merged", tips["p/merged"], 1);
-    branch("p/merged-live", "u"); merged("p/merged-live", tips["p/merged-live"], 2); // remote branch never deleted
-    branch("p/no-u", "plain", true); merged("p/no-u", tips["p/no-u"], 3); // pushed without -u
+    branch("p/merged", "u", true); g.merged("p/merged", tips["p/merged"], 1);
+    branch("p/merged-live", "u"); g.merged("p/merged-live", tips["p/merged-live"], 2); // remote branch never deleted
+    branch("p/no-u", "plain", true); g.merged("p/no-u", tips["p/no-u"], 3); // pushed without -u
     branch("p/desc", "u");
     const remote = mkdtempSync(join(root, "prune-remote-"));
     git(root, "clone", "-q", bare, remote);
@@ -1102,12 +1099,12 @@ describe("prune", () => {
     git(remote, "add", "."); git(remote, "commit", "-qm", "suggestion");
     git(remote, "push", "-q", "origin", "HEAD:refs/pull/11/head");
     git(remote, "push", "-q", "origin", "--delete", "p/desc");
-    merged("p/desc", git(remote, "rev-parse", "HEAD"), 11);
+    g.merged("p/desc", git(remote, "rev-parse", "HEAD"), 11);
     branch("p/gone", "u", true); // upstream gone, no PR
     branch("p/local"); // never pushed
     branch("p/open", "u"); // tracking, no PR
     branch("p/open2", "u");
-    branch("p/past", "u"); merged("p/past", tips["p/past"], 4);
+    branch("p/past", "u"); g.merged("p/past", tips["p/past"], 4);
     const past = join(root, "prune-past-more");
     git(c, "worktree", "add", "-q", past, "p/past");
     writeFileSync(join(past, "more.txt"), "after merge\n");
@@ -1115,12 +1112,12 @@ describe("prune", () => {
     git(c, "worktree", "remove", past);
 
     expect(wtGh("add", "p/inwt", "--fresh").code).toBe(0);
-    merged("p/inwt", git(join(c, "p-inwt"), "rev-parse", "HEAD"), 5);
-    merged("master", git(c, "rev-parse", "master"), 6);
+    g.merged("p/inwt", git(join(c, "p-inwt"), "rev-parse", "HEAD"), 5);
+    g.merged("master", git(c, "rev-parse", "master"), 6);
     // A worktree whose folder is gone for now, say on an unmounted volume.
     const vanished = join(root, "prune-vanished");
     git(c, "worktree", "add", "-q", "--no-track", "-b", "p/vanished", vanished, "origin/master");
-    merged("p/vanished", git(vanished, "rev-parse", "HEAD"), 8);
+    g.merged("p/vanished", git(vanished, "rev-parse", "HEAD"), 8);
     rmSync(vanished, { recursive: true });
     // A worktree stopped mid-rebase, which git lists as a detached HEAD.
     const rb = join(root, "prune-rb");
@@ -1131,7 +1128,7 @@ describe("prune", () => {
     git(rb, "checkout", "-q", "--no-track", "-b", "p/rb", "origin/master");
     writeFileSync(join(rb, "a.txt"), "ours\n");
     git(rb, "commit", "-qam", "ours");
-    merged("p/rb", git(rb, "rev-parse", "HEAD"), 9);
+    g.merged("p/rb", git(rb, "rev-parse", "HEAD"), 9);
     expect(sh("git", ["rebase", onto], rb).code).not.toBe(0);
     expect(git(rb, "rev-parse", "--abbrev-ref", "HEAD")).toBe("HEAD");
 
@@ -1147,7 +1144,7 @@ describe("prune", () => {
   });
 
   test("without --yes it lists every branch with its reason and changes nothing", () => {
-    writeFileSync(join(gh(), "calls"), "");
+    g.clearCalls();
     const r = wtGh("prune");
     expect(r.code).toBe(0);
     const m = rows(r.out);
@@ -1169,11 +1166,11 @@ describe("prune", () => {
     expect(r.out).toContain("not a worktree, left alone: stray-link/ holds 1 file");
     expect(r.out).not.toContain("config/");
     expect(r.out).not.toContain(".cache");
-    expect(r.out).toContain("run again with --yes to delete 4 merged branches and 1 empty folder, and add --gone for the 1 upstream-gone one");
+    expect(r.out).toContain("nothing changed; the lists above say what --yes and --yes --gone delete");
     for (const b of all) expect(has(b)).toBe(true);
     expect(existsSync(join(c, "stray-empty"))).toBe(true);
     expect(git(c, "worktree", "list")).toContain("prune-vanished");
-    for (const b of ["master", "p/inwt", "p/vanished", "p/rb"]) expect(ghCalls()).not.toContain(`--head ${b} `);
+    for (const b of ["master", "p/inwt", "p/vanished", "p/rb"]) expect(g.calls()).not.toContain(`--head ${b} `);
   });
 
   test("--yes deletes the merged branches and empty folders only, printing each SHA", () => {
@@ -1216,7 +1213,7 @@ describe("prune", () => {
   });
 
   test("when gh fails it warns and deletes nothing", () => {
-    branch("p/later", "u", true); merged("p/later", tips["p/later"], 7);
+    branch("p/later", "u", true); g.merged("p/later", tips["p/later"], 7);
     const r = sh("bun", [TOOL, "prune", "--yes"], c, { GIT_WT_GH: join(root, "no-such-gh") });
     expect(r.code).toBe(0);
     expect(r.out).toContain("cannot ask GitHub for merged PRs");
@@ -1268,7 +1265,8 @@ describe("open + wtc", () => {
     expect(wt(root, "clone", bare, "--dir", c).code).toBe(0);
     c = realpathSync(c);
     mkdirSync(bin());
-    writeFileSync(join(bin(), "yarn"), '#!/bin/sh\necho "$PWD" >> "$YARN_LOG"\n[ -n "$YARN_FAIL" ] && exit 3\nmkdir -p node_modules\n', { mode: 0o755 });
+    // A failing install still leaves node_modules behind, as a real one cut short does.
+    writeFileSync(join(bin(), "yarn"), '#!/bin/sh\necho "$PWD" >> "$YARN_LOG"\nmkdir -p node_modules\n[ -n "$YARN_FAIL" ] && exit 3\nexit 0\n', { mode: 0o755 });
     writeFileSync(join(bin(), "git-wt"), `#!/bin/sh\nexec bun "${TOOL}" "$@"\n`, { mode: 0o755 });
     mkdirSync(join(c, "master", ".claude"));
     writeFileSync(settings("master"), JSON.stringify({ enabledMcpjsonServers: ["tracer"], permissions: { allow: ["x"] } }));
@@ -1318,11 +1316,46 @@ describe("open + wtc", () => {
     rmSync(join(c, "master", "scratch.txt"));
   });
 
-  test("a failing install fails loudly", () => {
+  test("a failing install fails loudly, and the next open installs again", () => {
     const r = open("feat/c", { YARN_FAIL: "1" });
     expect(r.code).toBe(1);
     expect(r.err).toContain("yarn install failed");
     expect(r.out).toBe("");
+    expect(existsSync(join(c, "feat-c", "node_modules"))).toBe(true);
+    const runs = yarnRuns().length;
+    expect(open("feat/c").code).toBe(0);
+    expect(yarnRuns().length).toBe(runs + 1);
+    expect(open("feat/c").code).toBe(0); // installed now, so no third run
+    expect(yarnRuns().length).toBe(runs + 1);
+  });
+
+  test("a worktree from plain git-wt add installs on its first open, even with a node_modules", () => {
+    expect(sh("bun", [TOOL, "add", "feat/d"], c, env()).code).toBe(0);
+    mkdirSync(join(c, "feat-d", "node_modules")); // as a reused worktree would carry over
+    const runs = yarnRuns().length;
+    expect(open("feat/d").code).toBe(0);
+    expect(yarnRuns().length).toBe(runs + 1);
+  });
+
+  test("a default worktree without an upstream isn't fast-forwarded; the new branch starts from the remote", () => {
+    git(join(c, "master"), "branch", "--unset-upstream");
+    try {
+      const before = head(join(c, "master"));
+      const fresh = advanceRemote();
+      const r = open("feat/e");
+      expect(r.code).toBe(0);
+      expect(head(join(c, "feat-e"))).toBe(fresh);
+      expect(head(join(c, "master"))).toBe(before);
+    } finally {
+      git(join(c, "master"), "branch", "--set-upstream-to", "origin/master");
+    }
+  });
+
+  test("open --help goes to stderr, keeping stdout for the path", () => {
+    const r = sh("bun", [TOOL, "open", "--help"], c, env());
+    expect(r.code).toBe(0);
+    expect(r.out).toBe("");
+    expect(r.err).toContain("git-wt open <branch>");
   });
 
   for (const shell of ["bash", "zsh"]) {
@@ -1333,7 +1366,9 @@ describe("open + wtc", () => {
       const r = sh(shell, [flag, script], c, env());
       expect(r.code).toBe(0);
       expect(r.out.split("\n").slice(-2)).toEqual([`ran in ${join(c, "feat-a")}`, `now in ${join(c, "feat-a")}`]);
-      expect(sh(shell, [flag, `. "${join(import.meta.dir, "wtc.sh")}"; wtc`], c, env()).code).toBe(2);
+      const bare = sh(shell, [flag, `. "${join(import.meta.dir, "wtc.sh")}"; wtc; echo "still in $PWD"`], c, env());
+      expect(bare.err).toContain("usage: git-wt open");
+      expect(bare.out).toBe(`still in ${c}`);
     });
   }
 });

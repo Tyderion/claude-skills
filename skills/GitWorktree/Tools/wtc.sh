@@ -6,10 +6,6 @@
 # WTC_COMMAND is what runs in the worktree, evaluated by the shell (default: command claude).
 # Set it to "" to only change directory.
 wtc() {
-  if [ $# -lt 1 ]; then
-    echo "usage: wtc <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]" >&2
-    return 2
-  fi
   local wt
   wt=$(git-wt open "$@") || return
   cd "$wt" || return
