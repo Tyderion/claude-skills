@@ -58,9 +58,9 @@ const USAGE = `git-wt — bare-repo worktree containers
 
   git-wt prune [--yes] [--gone] [-C <container>]
       Find dead local branches: fetch --prune, then ask gh which branches have a
-      merged PR containing their tip, which works for squash merges. Also lists
-      branches whose upstream is gone without such a PR, branches with no upstream,
-      and folders in the container that aren't worktrees. Deletes nothing without
+      merged PR containing their tip, which works for squash merges. Lists every
+      local branch with the reason it would be deleted or kept, and folders in the
+      container that aren't worktrees. Deletes nothing without
       --yes, which deletes the merged branches (printing each SHA) and empty
       folders. --gone also deletes the upstream-gone ones. Never touched: the
       default branch (.bare/HEAD and every remote's HEAD) and branches a worktree
@@ -575,6 +575,8 @@ type GithubRemote = { repo: string; remote: string };
 /** A merged PR whose head commit is a branch's tip or descends from it. */
 type Proof = { repo: string; pr: number; mergedAt: string; base?: string };
 type Merged = Proof & { wt: Worktree };
+/** A merged PR of the branch that lacks `ahead` commits the branch made after it. */
+type Miss = { repo: string; pr: number; ahead: number };
 /** gh's reply, shaped like spawnSync's result so the sync and async routes share one reader. */
 type GhReply = { error?: Error; status: number | null; stdout: string; stderr: string };
 
@@ -601,8 +603,8 @@ function askAsync(args: string[], timeoutMs = 60_000): Promise<GhReply> {
 
 /** The most recently merged PR that contains `branch` at `tip`, so commits made after the merge
  *  disqualify it; undefined when there is none, or why gh couldn't say. `replies` holds gh's
- *  answer from each GitHub remote. */
-function mergedProof(container: string, branch: string, tip: string, replies: [GithubRemote, GhReply][]): Proof | string | undefined {
+ *  answer from each GitHub remote. Merged PRs that miss commits made after them go to `misses`. */
+function mergedProof(container: string, branch: string, tip: string, replies: [GithubRemote, GhReply][], misses?: Miss[]): Proof | string | undefined {
   const known = (oid: string) => gitTry(container, "cat-file", "-e", `${oid}^{commit}`).ok;
   let best: Proof | undefined;
   for (const [{ repo, remote }, r] of replies) {
@@ -626,6 +628,7 @@ function mergedProof(container: string, branch: string, tip: string, replies: [G
       }
       const contained = pr.headRefOid === tip || gitTry(container, "merge-base", "--is-ancestor", tip, pr.headRefOid).ok;
       if (contained && (!best || pr.mergedAt > best.mergedAt)) best = { repo, pr: pr.number, mergedAt: pr.mergedAt, base: pr.baseRefName };
+      if (!contained) misses?.push({ repo, pr: pr.number, ahead: Number(gitTry(container, "rev-list", "--count", `${pr.headRefOid}..${tip}`).out) });
     }
   }
   return best;
@@ -663,35 +666,44 @@ function dropReused(container: string, branch: string, tip: string, known?: Proo
 
 const prRef = (p: Proof) => `${p.repo}#${p.pr}${p.base ? ` into ${p.base}` : ""}`;
 
-/** Branches never deleted: the default per .bare/HEAD, plus each remote's HEAD, which stays right
- *  when .bare/HEAD doesn't (after convert on a feature branch, or a default renamed on GitHub). */
-function defaultBranches(container: string): Set<string> {
-  const set = new Set<string>();
+/** Branches never deleted, with why: the default per .bare/HEAD, plus each remote's HEAD, which stays
+ *  right when .bare/HEAD doesn't (after convert on a feature branch, or a default renamed on GitHub). */
+function defaultBranches(container: string): Map<string, string> {
+  const map = new Map<string, string>();
   const head = gitTry(container, "symbolic-ref", "--short", "HEAD");
-  if (head.ok) set.add(head.out);
+  if (head.ok) map.set(head.out, "default branch");
   for (const r of git(container, "remote").split("\n").filter(Boolean)) {
     const t = gitTry(container, "symbolic-ref", "--short", `refs/remotes/${r}/HEAD`);
-    if (t.ok && t.out.startsWith(`${r}/`)) set.add(t.out.slice(r.length + 1));
+    const b = t.ok && t.out.startsWith(`${r}/`) ? t.out.slice(r.length + 1) : "";
+    if (b && !map.has(b)) map.set(b, `default branch of ${r}`);
   }
-  return set;
+  return map;
 }
 
-/** Branches some worktree holds: checked out, or mid-rebase or mid-bisect, which git lists as a
- *  detached HEAD. Read from the admin dirs, so a worktree whose folder is missing still counts. */
-function busyBranches(container: string): Set<string> {
+/** Branches some worktree holds, with which one: checked out, or mid-rebase or mid-bisect, which git
+ *  lists as a detached HEAD. Read from the admin dirs, so a worktree whose folder is missing still counts. */
+function busyBranches(container: string): Map<string, string> {
   const bare = join(container, ".bare");
   const admin = join(bare, "worktrees");
   const dirs = [bare, ...(existsSync(admin) ? readdirSync(admin).map((n) => join(admin, n)) : [])];
   const read = (p: string) => (existsSync(p) ? readFileSync(p, "utf8").trim() : "");
-  const set = new Set<string>();
+  const map = new Map<string, string>();
   for (const d of dirs) {
-    for (const ref of [read(join(d, "HEAD")).replace(/^ref: /, ""), read(join(d, "rebase-merge", "head-name")), read(join(d, "rebase-apply", "head-name"))]) {
-      if (ref.startsWith("refs/heads/")) set.add(ref.slice(11));
+    // <admin>/gitdir names the worktree's .git file, relative to the admin dir with relative worktrees.
+    const folder = d === bare ? container : dirname(resolve(d, read(join(d, "gitdir"))));
+    const where = `${folder === container ? "the container" : `${relative(container, folder).startsWith("..") ? folder : relative(container, folder)}/`}${existsSync(folder) ? "" : " (folder missing)"}`;
+    const held: [string, string][] = [
+      ["checked out", read(join(d, "HEAD")).replace(/^ref: /, "")],
+      ["rebasing", read(join(d, "rebase-merge", "head-name"))],
+      ["rebasing", read(join(d, "rebase-apply", "head-name"))],
+      ["bisecting", read(join(d, "BISECT_START")).replace(/^(?!refs\/)/, "refs/heads/")], // bisect stores a bare name
+    ];
+    for (const [how, ref] of held) {
+      const b = ref.startsWith("refs/heads/") ? ref.slice(11) : "";
+      if (b && !map.has(b)) map.set(b, `${how} in ${where}`);
     }
-    const bisect = read(join(d, "BISECT_START")); // the branch bisect returns to, without refs/heads/
-    if (bisect) set.add(bisect.replace(/^refs\/heads\//, ""));
   }
-  return set;
+  return map;
 }
 
 // ---------------------------------------------------------------- prune
@@ -740,20 +752,34 @@ export async function prune(container: string, { yes = false, gone = false } = {
   // One gh call per branch and remote, ~0.5s each; a backlog of 100 branches would take a minute in a row.
   const replies = await mapLimit(candidates, 8, (b) =>
     Promise.all(remotes.map(async (r): Promise<[GithubRemote, GhReply]> => [r, await askAsync(mergedPrsArgs(r.repo, b.name))])));
-  const proofs = candidates.map((b, i) => mergedProof(container, b.name, b.tip, replies[i]));
+  const misses: Miss[][] = candidates.map(() => []);
+  const proofs = candidates.map((b, i) => mergedProof(container, b.name, b.tip, replies[i], misses[i]));
   const errors = proofs.filter((p) => typeof p === "string");
   if (errors.length) log(`warning: ${errors[0]}${errors.length > 1 ? `, and ${errors.length - 1} more like it` : ""}; those branches count as not merged`);
 
+  // Every branch lands in exactly one list, with the reason that put it there.
   const merged: [Branch, Proof][] = [];
-  const goneOnly: Branch[] = [];
-  const local: Branch[] = [];
-  candidates.forEach((b, i) => {
+  const goneOnly: [Branch, string][] = [];
+  const kept: [Branch, string][] = [];
+  const index = new Map(candidates.map((b, i) => [b.name, i]));
+  for (const b of branches) {
+    const i = index.get(b.name);
+    if (i === undefined) {
+      kept.push([b, defaults.get(b.name) ?? busy.get(b.name)!]);
+      continue;
+    }
     const p = proofs[i];
-    if (p && typeof p !== "string") merged.push([b, p]);
-    else if (b.gone) goneOnly.push(b);
-    else if (!b.upstream) local.push(b);
-  });
-  const tracking = candidates.length - merged.length - goneOnly.length - local.length;
+    if (p && typeof p !== "string") {
+      merged.push([b, p]);
+      continue;
+    }
+    const miss = misses[i].sort((x, y) => x.ahead - y.ahead)[0];
+    const unmerged = p ? "GitHub not asked (see warning)"
+      : miss ? `${miss.repo}#${miss.pr} merged, but ${miss.ahead} commit${miss.ahead === 1 ? "" : "s"} came after it`
+      : "no merged PR";
+    if (b.gone) goneOnly.push([b, `upstream gone, ${unmerged}`]);
+    else kept.push([b, `${b.upstream ? `tracking ${b.upstream.replace(/^refs\/remotes\//, "")}` : "no upstream"}, ${unmerged}`]);
+  }
 
   const failed: string[] = [];
   const drop = (b: Branch, why: string) => {
@@ -765,17 +791,16 @@ export async function prune(container: string, { yes = false, gone = false } = {
     if (r.ok) log(`deleted ${b.name} (was ${b.short}; ${why})`);
     else failed.push(`${b.name}: ${r.err.trim()}`);
   };
-  const list = (title: string, items: string[]) => {
-    if (items.length) log(`${title} (${items.length}):\n  ${items.join("\n  ")}`);
+  const width = Math.min(50, Math.max(0, ...branches.map((b) => b.name.length)));
+  const list = (title: string, rows: [Branch, string][]) => {
+    if (rows.length) log(`${title} (${rows.length}):\n${rows.map(([b, why]) => `  ${b.name.padEnd(width)}  ${b.short}  ${why}`).join("\n")}`);
   };
 
   if (yes) for (const [b, p] of merged) drop(b, `merged in ${prRef(p)}`);
-  else list("merged, deleted by --yes", merged.map(([b, p]) => `${b.name}  ${b.short}  ${prRef(p)}`));
-  if (yes && gone) for (const b of goneOnly) drop(b, "upstream gone");
-  else list(`upstream gone but no merged PR found, ${yes ? "kept without" : "deleted by --yes"} --gone`, goneOnly.map((b) => `${b.name}  ${b.short}`));
-  list("no upstream, kept", local.map((b) => `${b.name}  ${b.short}`));
-  const inTrees = branches.filter((b) => !defaults.has(b.name) && busy.has(b.name)).length;
-  log(`kept: ${tracking} tracking an existing remote branch, ${inTrees} checked out in a worktree`);
+  else list("deleted by --yes", merged.map(([b, p]) => [b, `merged in ${prRef(p)}`]));
+  if (yes && gone) for (const [b, why] of goneOnly) drop(b, why);
+  else list(yes ? "kept without --gone" : "deleted by --yes --gone", goneOnly);
+  list("kept", kept);
 
   // Folders here that aren't worktrees: what git worktree remove leaves when something wrote into
   // the folder after removal. Empty ones go; anything with files is left for a person to look at.

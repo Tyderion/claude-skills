@@ -25,7 +25,7 @@ Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/{{SKILL_NAME}}/PREFERENCES.md`
 | Share one file across worktrees (edits visible everywhere) | move it to the container root, list it under `[link]` in `<container>/.shared`, then `git-wt sync` |
 | Give each worktree its own editable copy of a default | put the default in the container root, list it under `[copy]`, then `git-wt sync` |
 | Throw away a worktree's edits to a copied file | `git-wt sync --reset <path>` (replaces every diverged copy with the root default) |
-| Clean up dead local branches | `git-wt prune` first and show the principal the list; only then `git-wt prune --yes`. Add `--gone` only when the principal asks to drop upstream-gone branches that have no merged PR |
+| Clean up dead local branches | `git-wt prune` first (every local branch, grouped by fate, with the reason on its line) and show the principal the list; only then `git-wt prune --yes`. Add `--gone` only when the principal asks to drop upstream-gone branches that have no merged PR |
 
 Base directory for `clone` defaults to `$GIT_WT_BASE`, else `~/coding`. Worktree folders are the branch name with `/` → `-` (`feature/x` → `feature-x/`).
 

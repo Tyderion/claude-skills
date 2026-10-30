@@ -1053,6 +1053,18 @@ describe("prune", () => {
   const merged = (branch: string, oid: string, n: number) =>
     writeFileSync(join(gh(), `${branch.replace(/\//g, "-")}.json`), JSON.stringify([{ number: n, headRefOid: oid, mergedAt: "2026-10-01T00:00:00Z" }]));
   const ghCalls = () => (existsSync(join(gh(), "calls")) ? readFileSync(join(gh(), "calls"), "utf8") : "");
+  /** The section, short SHA and reason prune printed for each branch. */
+  const rows = (out: string) => {
+    const m = new Map<string, { section: string; sha: string; why: string }>();
+    let section = "";
+    for (const line of out.split("\n")) {
+      const h = /^(\S.*) \(\d+\):$/.exec(line);
+      if (h) section = h[1];
+      const r = /^  (\S+) +([0-9a-f]{7,})  (.*)$/.exec(line);
+      if (r && section) m.set(r[1], { section, sha: r[2], why: r[3] });
+    }
+    return m;
+  };
   const has = (b: string) => sh("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${b}`], c).code === 0;
   const tips: Record<string, string> = {};
   /** A branch with one commit of its own, made in a scratch worktree outside the container.
@@ -1134,24 +1146,31 @@ describe("prune", () => {
     mkdirSync(join(c, ".cache"));
   });
 
-  test("without --yes it lists every group and changes nothing", () => {
+  test("without --yes it lists every branch with its reason and changes nothing", () => {
     writeFileSync(join(gh(), "calls"), "");
     const r = wtGh("prune");
     expect(r.code).toBe(0);
-    expect(r.out).toContain("merged, deleted by --yes (4):");
-    expect(r.out).toContain(`p/merged  ${tips["p/merged"].slice(0, 7)}`);
-    expect(r.out).toContain("t/prune#1");
-    for (const b of ["p/merged-live", "p/no-u", "p/desc"]) expect(r.out).toContain(`${b}  `);
-    expect(r.out).toMatch(/upstream gone but no merged PR found, deleted by --yes --gone \(1\):\n\s+p\/gone /);
-    expect(r.out).toMatch(/no upstream, kept \(1\):\n\s+p\/local /);
-    expect(r.out).toContain("kept: 3 tracking an existing remote branch, 3 checked out in a worktree");
+    const m = rows(r.out);
+    const all = [...Object.keys(tips), "p/inwt", "p/vanished", "p/rb", "master"];
+    expect([...m.keys()].sort()).toEqual(all.sort());
+    expect(m.get("p/merged")).toEqual({ section: "deleted by --yes", sha: tips["p/merged"].slice(0, 7), why: "merged in t/prune#1" });
+    for (const b of ["p/merged-live", "p/no-u", "p/desc"]) expect(m.get(b)?.section).toBe("deleted by --yes");
+    expect(m.get("p/gone")).toMatchObject({ section: "deleted by --yes --gone", why: "upstream gone, no merged PR" });
+    const kept = (b: string) => (expect(m.get(b)?.section).toBe("kept"), m.get(b)!.why);
+    expect(kept("p/local")).toBe("no upstream, no merged PR");
+    expect(kept("p/open")).toBe("tracking origin/p/open, no merged PR");
+    expect(kept("p/past")).toBe("tracking origin/p/past, t/prune#4 merged, but 1 commit came after it");
+    expect(kept("p/inwt")).toBe("checked out in p-inwt/");
+    expect(kept("p/vanished")).toMatch(/^checked out in \/.*prune-vanished\/ \(folder missing\)$/);
+    expect(kept("p/rb")).toMatch(/^rebasing in \/.*prune-rb\/$/);
+    expect(kept("master")).toBe("default branch");
     expect(r.out).toContain("not a worktree, removed by --yes: stray-empty/ (empty)");
     expect(r.out).toContain("not a worktree, left alone: stray-full/ holds 1 file");
     expect(r.out).toContain("not a worktree, left alone: stray-link/ holds 1 file");
     expect(r.out).not.toContain("config/");
     expect(r.out).not.toContain(".cache");
     expect(r.out).toContain("run again with --yes to delete 4 merged branches and 1 empty folder, and add --gone for the 1 upstream-gone one");
-    for (const b of [...Object.keys(tips), "p/inwt", "p/vanished", "p/rb", "master"]) expect(has(b)).toBe(true);
+    for (const b of all) expect(has(b)).toBe(true);
     expect(existsSync(join(c, "stray-empty"))).toBe(true);
     expect(git(c, "worktree", "list")).toContain("prune-vanished");
     for (const b of ["master", "p/inwt", "p/vanished", "p/rb"]) expect(ghCalls()).not.toContain(`--head ${b} `);
@@ -1178,7 +1197,7 @@ describe("prune", () => {
   test("--gone also deletes upstream-gone branches, never local or checked-out ones", () => {
     const r = wtGh("prune", "--yes", "--gone");
     expect(r.code).toBe(0);
-    expect(r.out).toContain(`deleted p/gone (was ${tips["p/gone"].slice(0, 7)}; upstream gone)`);
+    expect(r.out).toContain(`deleted p/gone (was ${tips["p/gone"].slice(0, 7)}; upstream gone, no merged PR)`);
     expect(has("p/gone")).toBe(false);
     for (const b of ["p/local", "p/open", "p/past", "p/inwt", "p/vanished", "p/rb", "master"]) expect(has(b)).toBe(true);
   });
@@ -1188,8 +1207,9 @@ describe("prune", () => {
     try {
       const r = wtGh("prune");
       expect(r.code).toBe(0);
-      expect(r.out).not.toMatch(/^\s+master /m);
-      expect(r.out).not.toMatch(/^\s+p\/open /m);
+      const m = rows(r.out);
+      expect(m.get("master")).toMatchObject({ section: "kept", why: "default branch of origin" });
+      expect(m.get("p/open")).toMatchObject({ section: "kept", why: "default branch" });
     } finally {
       git(c, "symbolic-ref", "HEAD", "refs/heads/master");
     }
