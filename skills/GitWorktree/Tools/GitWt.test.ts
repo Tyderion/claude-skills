@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1235,4 +1235,105 @@ describe("prune", () => {
     expect(r.out).toContain("master is still a local branch; nothing was deleted");
     expect(has("master")).toBe(true);
   });
+});
+
+describe("open + wtc", () => {
+  let c: string;
+  let bare: string;
+  const bin = () => join(root, "open-bin");
+  const yarnLog = () => join(root, "open-yarn.log");
+  const env = (extra: Record<string, string> = {}) => ({ PATH: `${bin()}:${process.env.PATH}`, YARN_LOG: yarnLog(), ...extra });
+  const open = (branch: string, extra: Record<string, string> = {}) => sh("bun", [TOOL, "open", branch], c, env(extra));
+  const yarnRuns = () => (existsSync(yarnLog()) ? readFileSync(yarnLog(), "utf8").split("\n").filter(Boolean) : []);
+  const head = (dir: string) => git(dir, "rev-parse", "HEAD");
+  const settings = (w: string) => join(c, w, ".claude", "settings.local.json");
+  function advanceRemote(): string {
+    const tmp = mkdtempSync(join(root, "open-push-"));
+    git(root, "clone", "-q", bare, tmp);
+    writeFileSync(join(tmp, "later.txt"), `${tmp}\n`);
+    git(tmp, "add", "."); git(tmp, "commit", "-qm", "later");
+    git(tmp, "push", "-q", "origin", "master");
+    return git(tmp, "rev-parse", "HEAD");
+  }
+
+  beforeAll(() => {
+    bare = makeRemote("open-r");
+    const tmp = mkdtempSync(join(root, "open-init-"));
+    git(root, "clone", "-q", bare, tmp);
+    writeFileSync(join(tmp, "yarn.lock"), "# lock\n");
+    writeFileSync(join(tmp, ".gitignore"), ".env\nbuild/\nnode_modules/\n.claude/\n");
+    git(tmp, "add", "."); git(tmp, "commit", "-qm", "yarn");
+    git(tmp, "push", "-q", "origin", "master");
+    c = join(root, "openproj");
+    expect(wt(root, "clone", bare, "--dir", c).code).toBe(0);
+    c = realpathSync(c);
+    mkdirSync(bin());
+    writeFileSync(join(bin(), "yarn"), '#!/bin/sh\necho "$PWD" >> "$YARN_LOG"\n[ -n "$YARN_FAIL" ] && exit 3\nmkdir -p node_modules\n', { mode: 0o755 });
+    writeFileSync(join(bin(), "git-wt"), `#!/bin/sh\nexec bun "${TOOL}" "$@"\n`, { mode: 0o755 });
+    mkdirSync(join(c, "master", ".claude"));
+    writeFileSync(settings("master"), JSON.stringify({ enabledMcpjsonServers: ["tracer"], permissions: { allow: ["x"] } }));
+  });
+
+  test("a new branch pulls the clean default worktree, installs, inherits MCP approvals, prints only the path", () => {
+    const fresh = advanceRemote();
+    const r = open("feat/a");
+    expect(r.code).toBe(0);
+    expect(r.out).toBe(join(c, "feat-a"));
+    expect(r.err).toContain("worktree feat-a/ on feat/a");
+    expect(head(join(c, "master"))).toBe(fresh);
+    expect(head(join(c, "feat-a"))).toBe(fresh);
+    expect(yarnRuns()).toEqual([join(c, "feat-a")]);
+    expect(JSON.parse(readFileSync(settings("feat-a"), "utf8"))).toEqual({ enabledMcpjsonServers: ["tracer"] });
+  });
+
+  test("an existing worktree is used as it is, installing only without node_modules", () => {
+    const before = head(join(c, "master"));
+    advanceRemote();
+    let r = open("feat/a");
+    expect(r.code).toBe(0);
+    expect(r.out).toBe(join(c, "feat-a"));
+    expect(head(join(c, "master"))).toBe(before);
+    expect(yarnRuns().length).toBe(1);
+    rmSync(join(c, "feat-a", "node_modules"), { recursive: true });
+    r = open("feat/a");
+    expect(yarnRuns().length).toBe(2);
+  });
+
+  test("MCP approvals the worktree already has are kept", () => {
+    const own = JSON.stringify({ disabledMcpjsonServers: ["tracer"] });
+    writeFileSync(settings("feat-a"), own);
+    expect(open("feat/a").code).toBe(0);
+    expect(readFileSync(settings("feat-a"), "utf8")).toBe(own);
+  });
+
+  test("a dirty default worktree is left alone; the new branch starts from the fetched remote", () => {
+    writeFileSync(join(c, "master", "scratch.txt"), "mine\n");
+    const before = head(join(c, "master"));
+    const fresh = advanceRemote();
+    const r = open("feat/b");
+    expect(r.code).toBe(0);
+    expect(head(join(c, "feat-b"))).toBe(fresh);
+    expect(head(join(c, "master"))).toBe(before);
+    expect(readFileSync(join(c, "master", "scratch.txt"), "utf8")).toBe("mine\n");
+    rmSync(join(c, "master", "scratch.txt"));
+  });
+
+  test("a failing install fails loudly", () => {
+    const r = open("feat/c", { YARN_FAIL: "1" });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("yarn install failed");
+    expect(r.out).toBe("");
+  });
+
+  for (const shell of ["bash", "zsh"]) {
+    test(`wtc in ${shell} lands in the worktree and runs WTC_COMMAND there`, () => {
+      if (sh("sh", ["-c", `command -v ${shell}`], root).code !== 0) return; // not installed here
+      const script = `. "${join(import.meta.dir, "wtc.sh")}"; WTC_COMMAND='echo "ran in $PWD"'; wtc feat/a; echo "now in $PWD"`;
+      const flag = shell === "zsh" ? "-fc" : "-c"; // -f: no rc files
+      const r = sh(shell, [flag, script], c, env());
+      expect(r.code).toBe(0);
+      expect(r.out.split("\n").slice(-2)).toEqual([`ran in ${join(c, "feat-a")}`, `now in ${join(c, "feat-a")}`]);
+      expect(sh(shell, [flag, `. "${join(import.meta.dir, "wtc.sh")}"; wtc`], c, env()).code).toBe(2);
+    });
+  }
 });

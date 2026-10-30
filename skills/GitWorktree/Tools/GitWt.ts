@@ -9,7 +9,7 @@
  *   <container>/<file>      a shared file's single real copy
  *   <container>/<worktree>/ one folder per branch, named after the branch with / -> -
  *
- * Subcommands: clone, convert, add, reuse, sync, prune. Run with --help for usage.
+ * Subcommands: clone, convert, add, reuse, sync, prune, open. Run with --help for usage.
  */
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -65,6 +65,16 @@ const USAGE = `git-wt — bare-repo worktree containers
       folders. --gone also deletes the upstream-gone ones. Never touched: the
       default branch (.bare/HEAD and every remote's HEAD) and branches a worktree
       has checked out, is rebasing or is bisecting, even if its folder is missing.
+
+  git-wt open <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]
+      Get <branch>'s worktree ready and print its path, alone, on stdout (the rest
+      goes to stderr). An existing worktree is used as it is. Otherwise the default
+      branch's worktree is pulled first (when it is dirty, the remote is fetched and
+      a new branch starts from <remote>/<default>), then add runs, reuse included.
+      Then: direnv allow when .envrc is the shared one, an install with the
+      lockfile's package manager for a new or reused worktree or one without
+      node_modules, and Claude Code's MCP approvals copied from the default
+      branch's worktree when the target has none. Tools/wtc.sh wraps it as wtc.
 `;
 
 class Fail extends Error {}
@@ -72,7 +82,8 @@ const fail = (msg: string): never => { throw new Fail(msg); };
 /** A refusal raised before anything changed, so a caller may safely try another route. */
 class Refused extends Fail {}
 const refuse = (msg: string): never => { throw new Refused(msg); };
-const log = (msg: string) => console.log(msg);
+// `open` points this at stderr: its stdout is the worktree path alone, for `cd "$(git-wt open …)"`.
+let log = (msg: string) => console.log(msg);
 
 function run(cmd: string, args: string[], cwd?: string, allowFail = false) {
   // spawn reports a missing cwd as the *command* being missing ("git: ENOENT").
@@ -835,6 +846,79 @@ export async function prune(container: string, { yes = false, gone = false } = {
   else if (goneOnly.length) log(`nothing changed; --yes --gone deletes the ${goneOnly.length} upstream-gone branch${goneOnly.length === 1 ? "" : "es"}`);
 }
 
+// ---------------------------------------------------------------- open
+
+/** Run a command for what it does, with its output on stderr so stdout stays free for the path. */
+function runAside(cmd: string, args: string[], cwd: string) {
+  const r = spawnSync(cmd, args, { cwd, stdio: ["inherit", 2, 2] });
+  if (r.error) fail(`${cmd}: ${r.error.message}`);
+  if (r.status !== 0) fail(`${cmd} ${args.join(" ")} failed in ${cwd} (exit ${r.status})`);
+}
+const onPath = (cmd: string) => !spawnSync(cmd, ["--version"], { stdio: "ignore" }).error;
+const sameFile = (a: string, b: string) => existsSync(a) && existsSync(b) && realpathSync(a) === realpathSync(b);
+
+const LOCKFILES: [string, string][] = [["yarn.lock", "yarn"], ["pnpm-lock.yaml", "pnpm"], ["bun.lock", "bun"], ["bun.lockb", "bun"], ["package-lock.json", "npm"]];
+
+/** Copy the project's MCP server approvals (Claude Code's settings.local.json) from one worktree to
+ *  another that recorded none, so a new worktree starts without the approval prompt. */
+function inheritMcpDecisions(from: string, to: string) {
+  const src = join(from, ".claude", "settings.local.json");
+  const dst = join(to, ".claude", "settings.local.json");
+  if (!existsSync(src) || sameFile(src, dst)) return;
+  const readJson = (p: string) => {
+    try { return JSON.parse(readFileSync(p, "utf8")); } catch (e) { return fail(`${p}: ${(e as Error).message}`); }
+  };
+  const keys = ["enabledMcpjsonServers", "disabledMcpjsonServers"];
+  const target = existsSync(dst) ? readJson(dst) : {};
+  if (keys.some((k) => k in target)) return;
+  const source = readJson(src);
+  const picked = keys.filter((k) => source[k] != null);
+  if (!picked.length) return;
+  for (const k of picked) target[k] = source[k];
+  mkdirSync(dirname(dst), { recursive: true });
+  writeFileSync(`${dst}.git-wt-tmp`, `${JSON.stringify(target, null, 2)}\n`);
+  renameSync(`${dst}.git-wt-tmp`, dst);
+  log(`copied ${picked.join(" and ")} from ${basename(from)}/`);
+}
+
+/** The worktree for `branch`, made ready to work in: created (or reused) when missing, its
+ *  dependencies installed, its MCP approvals inherited. Returns its path; logs go to stderr. */
+export function open(container: string, branch: string, opts: { from?: string; remote?: string; fresh?: boolean } = {}): string {
+  const all = worktrees(container);
+  const od = gitTry(container, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
+  const def = od.ok ? od.out.replace(/^origin\//, "") : defaultBranch(container);
+  const defWt = all.find((w) => w.branch === def)?.path;
+  let wt = all.find((w) => w.branch === branch)?.path;
+  const created = !wt;
+  if (!wt) {
+    let from = opts.from;
+    // A new branch should start from the remote's latest default, not a stale local one.
+    if (defWt && git(defWt, "status", "--porcelain") === "") {
+      runAside("git", ["pull", "--ff-only"], defWt);
+    } else {
+      const remotes = git(container, "remote").split("\n").filter(Boolean);
+      const remote = remotes.includes("origin") ? "origin" : remotes[0];
+      if (remote) {
+        runAside("git", ["fetch", remote], container);
+        const has = (ref: string) => gitTry(container, "rev-parse", "--verify", "--quiet", ref).ok;
+        const exists = has(`refs/heads/${branch}`) || remotes.some((r) => has(`refs/remotes/${r}/${branch}`));
+        if (!from && !opts.remote && !exists && has(`refs/remotes/${remote}/${def}`)) from = `${remote}/${def}`;
+      }
+    }
+    wt = add(container, branch, from, opts.remote, opts.fresh);
+  }
+
+  const envrc = join(wt, ".envrc");
+  if (sameFile(envrc, join(container, ".envrc")) && onPath("direnv")) runAside("direnv", ["allow", wt], wt);
+  // A reused worktree keeps the previous branch's node_modules, so it installs too.
+  if (created || !existsSync(join(wt, "node_modules"))) {
+    const pm = LOCKFILES.find(([file]) => existsSync(join(wt!, file)));
+    if (pm) runAside(pm[1], ["install"], wt);
+  }
+  if (defWt) inheritMcpDecisions(defWt, wt);
+  return wt;
+}
+
 // ---------------------------------------------------------------- convert
 
 const journalFor = (top: string) => `${top}.git-wt-convert.json`;
@@ -1091,6 +1175,7 @@ const OPTIONS = {
   reuse: { from: str, remote: str, C: container },
   sync: { reset: str, C: container },
   prune: { yes: { type: "boolean" }, gone: { type: "boolean" }, C: container },
+  open: { from: str, remote: str, fresh: { type: "boolean" }, C: container },
 } as const;
 
 function main(argv: string[]) {
@@ -1125,6 +1210,11 @@ function main(argv: string[]) {
     case "prune":
       if (pos.length) fail("usage: git-wt prune [--yes] [--gone] [-C <container>]");
       return prune(findContainer(flags.C ?? process.cwd()), { yes: Boolean(values.yes), gone: Boolean(values.gone) });
+    case "open": {
+      if (pos.length !== 1) fail("usage: git-wt open <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]");
+      log = (msg) => console.error(msg);
+      return void console.log(open(findContainer(flags.C ?? process.cwd()), pos[0], { from: flags.from, remote: flags.remote, fresh: Boolean(values.fresh) }));
+    }
   }
 }
 

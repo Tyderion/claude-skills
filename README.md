@@ -4,7 +4,7 @@ Claude Code skills, kept in git so every machine gets the same ones.
 
 | Skill | What it does |
 |---|---|
-| `GitWorktree` | Bare-repo worktree containers through the `git-wt` CLI: clone, convert, add, reuse, shared files |
+| `GitWorktree` | Bare-repo worktree containers through the `git-wt` CLI: clone, convert, add, reuse, prune, shared files; `wtc` opens a branch's worktree and starts Claude there (source `Tools/wtc.sh` from your bash or zsh rc) |
 | `review-loop` | Multi-round review, simplicity first and correctness second, with fixes applied between rounds |
 | `ha-spec` | Writes a behavioral spec for a Home Assistant change, for a Claude session on the Home Assistant box to implement |
 
