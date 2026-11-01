@@ -17,6 +17,16 @@ describe("auto-review stays in step with review-loop", () => {
     expect(loop).toMatch(new RegExp(`^#+ ${number}\\. ${title}$`, "m"));
   });
 
+  // A new question step in review-loop would otherwise stop an unattended run.
+  test("every step that asks the user is overridden", () => {
+    const overridden = new Set(cited.map((m) => m[1]));
+    let step: string | undefined;
+    for (const line of loop.split("\n")) {
+      step = line.match(/^#+ (\d[a-z]?)\. /)?.[1] ?? step;
+      if (step && line.includes("AskUserQuestion")) expect(overridden).toContain(step);
+    }
+  });
+
   test.each([
     ["auto-review", wrapper],
     ["review-loop", loop],

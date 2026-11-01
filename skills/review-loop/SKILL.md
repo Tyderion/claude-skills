@@ -1,6 +1,6 @@
 ---
 name: review-loop
-description: Multi-round code review in two phases, simplicity first and correctness second. Each round starts a fresh read-only reviewer subagent. The main agent triages its findings, asks the user about each one with suggested fixes (the user can also write their own), applies the chosen fixes and starts the next round. "soft" (also weak, short, quick) runs 1 simplicity + 1 correctness round (the default); "strong" (also hard, long, detailed) runs 2 + 2. By default it reviews the current branch (commits plus uncommitted changes) against main/master. USE WHEN review loop, review my changes, simplicity review, correctness review, strong review, hard review, long review, detailed review, soft review, weak review, short review, quick review, review this branch, review before PR. NOT FOR a single one-shot review with no fixes applied, or applying fixes without being asked (use auto-review).
+description: Multi-round code review in two phases, simplicity first and correctness second. Each round starts a fresh read-only reviewer subagent. The main agent triages its findings, asks the user about each one with suggested fixes (the user can also write their own), applies the chosen fixes and starts the next round. "soft" (also weak, short, quick) runs 1 simplicity + 1 correctness round (the default); "strong" (also hard, long, detailed) runs 2 + 2. By default it reviews the current branch (commits plus uncommitted changes) against main/master. USE WHEN review loop, review my changes, simplicity review, correctness review, strong review, hard review, long review, detailed review, soft review, weak review, short review, quick review, review this branch, review before PR. NOT FOR a review explicitly asked to be one-shot, or applying fixes without being asked (use auto-review).
 argument-hint: "[soft|strong] [uncommitted | vs <branch> | <paths...>]"
 ---
 
@@ -8,14 +8,14 @@ argument-hint: "[soft|strong] [uncommitted | vs <branch> | <paths...>]"
 
 Runs a code review in rounds. A reviewer subagent finds issues, the user decides what to do about each one, the main agent applies the decisions, and the next round reviews the result. Simplicity comes first, because simpler code is easier to check for correctness.
 
-This skill only uses git and Claude Code's built-in tools (`Agent`, `AskUserQuestion`, `Read`, `Edit`, `Bash`). It works in any repo on any machine.
+This skill only uses git and Claude Code's built-in tools (`Agent`, `AskUserQuestion`, `Read`, `Edit`, `Bash`).
 
 ## 1. Parse the arguments
 
-From `$ARGUMENTS`:
+Arguments: `$ARGUMENTS` (none means every default below).
 
 - **Depth:** `strong` (also `hard`, `long`, `detailed`) means 2 simplicity rounds, then 2 correctness rounds. `soft` (also `weak`, `short`, `quick`) means 1 + 1. If neither is given, use `soft`. A bare depth word is always the depth, even if a file has that name; write `./quick` to target the file.
-- **Target:** the default is **branch vs base**. `uncommitted` (also "uncommitted files", "working tree") means **uncommitted only**. `vs <ref>` or `base <ref>` means **branch vs** the named ref. Anything that looks like file or directory paths means **paths**.
+- **Target:** the default is **branch vs base**. `uncommitted` (also "uncommitted files", "working tree") means **uncommitted only**. `vs <ref>` or `base <ref>` means **branch vs** the named ref. Paths on their own mean **paths**: the named files, and every file under a named directory, reviewed in full. Paths after `uncommitted` or `vs` restrict that diff to them (`git diff <sha> -- <paths>`).
 
 ## 2. Resolve the target once and freeze it
 
@@ -26,7 +26,7 @@ Run each git command in its own `Bash` call, and paste each result into the next
 1. If the user named a ref, use it. Otherwise pick the first of these that resolves: `git symbolic-ref --quiet --short refs/remotes/origin/HEAD`, then `git rev-parse --verify --quiet` on each of `origin/main`, `origin/master`, `main`, `master`. `origin/HEAD` is often unset, especially in bare-repo or worktree clones, so the fallbacks matter. If nothing resolves, ask the user which branch to use.
 2. `git merge-base HEAD <base>` gives the **fork-point SHA**. Freeze it for the whole run. Later rounds diff against the same SHA, even if fixes get committed along the way.
 3. The review scope is `git diff <sha>` (branch commits plus uncommitted changes, compared with the working tree), plus the untracked files listed by `git ls-files --others --exclude-standard`.
-4. If the fork point equals `HEAD`, you are on the base branch. Tell the user that only uncommitted changes are in scope.
+4. If the fork point equals `HEAD`, the branch has no commits of its own. Tell the user that only uncommitted changes are in scope.
 
 **Uncommitted only:** freeze the SHA from `git rev-parse HEAD`. The scope is `git diff <sha>` plus the untracked files.
 
@@ -48,19 +48,19 @@ For each round, start one fresh `Agent` (general-purpose). Build its prompt from
 
 - the brief for the current phase, read from this skill's folder: `SimplicityBrief.md` or `CorrectnessBrief.md`
 - the frozen target: the exact diff command with the literal SHA, the untracked-files command, or the list of paths, plus the repo root
-- the **declined list**: findings the user skipped in earlier rounds of this run, one line each, so they are not raised again
+- the **declined list**: findings the user skipped in earlier rounds of this run, as `file:line — problem` so the fresh reviewer can match them, with a line telling it not to raise them again
 - a line saying this is round k of N for this phase
 
 The reviewer is read-only. It must never edit, write, commit or stage anything, and the prompt says so.
 
 ### 3b. Triage before asking
 
-Do not forward the reviewer's findings as they come in. For each one, read the cited code yourself and drop it if:
+Read the cited code yourself before forwarding any finding, and drop it if:
 
 - the claim is wrong
 - it duplicates another finding
 - it is already on the declined list
-- it is out of scope (outside the target, or the wrong phase)
+- it is out of scope (a problem the target neither contains nor causes, or the wrong phase)
 
 A finding that survives is one you would defend. Sort the survivors by severity.
 
@@ -79,11 +79,10 @@ With more than 4 findings, ask in consecutive calls of up to 4, most severe firs
 
 ### 3d. Apply the decisions
 
+- Add skipped findings to the declined list. If nothing else is left (everything skipped), end the phase early.
 - Apply every chosen fix. Where a custom answer is ambiguous, pick the reading that fits the finding and mention that you did.
-- Add skipped findings to the declined list.
 - Do not commit, stage or push. The user owns git history.
-- Then run the project's own checks, if it has any: tests, typecheck, lint. Discover them from the project (package manifests, Makefile, justfile, task runner configs, CI workflow) and use what it already defines. If a fix breaks a check, fix it or undo that fix before the next round, and tell the user which.
-- If nothing was applied this round (everything skipped), end the phase early.
+- Then run the project's own checks, if it has any: tests, typecheck, lint. Discover them from the project (package manifests, Makefile, justfile, task runner configs, CI workflow) and use what it already defines. Run them once before round 1 too, so you know what already fails. If a check that passed before now fails, fix it or undo that fix before the next round, and tell the user which.
 
 ## 4. Final report
 
