@@ -18,7 +18,7 @@ claude-skills/setup
 
 Once `git-wt` is installed, later clones can use the worktree layout instead: `git-wt clone https://github.com/Tyderion/claude-skills.git`, then `claude-skills/main/setup`.
 
-`setup` copies each `skills/<name>/` to `~/.claude/skills/`, as `_<name>` when the machine runs LifeOS and as `<name>` otherwise (`--prefix` / `--no-prefix` override). It fills in `{{SKILL_NAME}}`, `{{SKILL_DIR}}` and `{{SOURCE_DIR}}`, writes shims such as `git-wt` to `~/.local/bin`, and checks the commands each skill needs.
+`setup` copies each `skills/<name>/` to `~/.claude/skills/`, as `_<name>` when the machine runs LifeOS and as `<name>` otherwise (`--prefix` / `--no-prefix` override). It fills in `{{SKILL_NAME}}`, `{{SKILL_DIR}}` and `{{SOURCE_DIR}}`, writes shims such as `git-wt` to `~/.local/bin`, and checks the commands each skill needs. Each copy gets a `.gitignore` holding `*`, so a `~/.claude` that is itself a git repo never commits it.
 
 Missing commands are installed with pacman on Arch-family Linux and with Homebrew on macOS, after asking (`--yes` skips the question; without a terminal, setup prints the command instead). On any other system, or for something those managers can't provide, setup prints a prompt to paste into Claude Code and exits 2.
 

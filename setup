@@ -11,7 +11,8 @@ Usage: ./setup [--prefix | --no-prefix] [--yes] [--force] [<skill>...]
 Copies skills/<name>/ to ~/.claude/skills/[_]<name>/ (CLAUDE_CONFIG_DIR moves
 ~/.claude), fills in {{SKILL_NAME}}, {{SKILL_DIR}} and {{SOURCE_DIR}}, writes a
 bun shim to ~/.local/bin (XDG_BIN_HOME moves it) for each `bin` entry, and makes
-sure the commands every skill's install.conf asks for are there.
+sure the commands every skill's install.conf asks for are there. Each copy
+ignores itself in git, so a ~/.claude that is a repo never commits it.
 
   --prefix      install as _<name> (the default when ~/.claude/LIFEOS exists)
   --no-prefix   install as <name>
@@ -33,6 +34,7 @@ OS_RELEASE=${SETUP_OS_RELEASE:-/etc/os-release} # tests point these two at fakes
 KERNEL=${SETUP_UNAME:-$(uname -s)}
 . "$OS_RELEASE" 2>/dev/null || true # ID, ID_LIKE, PRETTY_NAME; absent on macOS
 MARKER=.skill-install
+SELF_IGNORE=.gitignore # holds `*`: an installed copy stays out of a ~/.claude that is a git repo
 SHIM_TAG="# installed by claude-skills setup"
 
 say() { printf '%s\n' "$*"; }
@@ -208,10 +210,10 @@ fi
 
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
 # Content hash of a directory: each file's path, executable bit and bytes, and each symlink's
-# target, so a chmod +x or a retargeted link counts as a change. The marker is left out, and
-# so is macOS metadata (Finder drops .DS_Store into any folder it opens).
+# target, so a chmod +x or a retargeted link counts as a change. The marker and the top-level
+# self-ignore are left out, and so is macOS metadata (Finder drops .DS_Store into any folder it opens).
 hash_tree() {
-  (CDPATH= cd -- "$1" && find . \( -type f -o -type l \) ! -name "$MARKER" ! -name .DS_Store ! -name '._*' | LC_ALL=C sort \
+  (CDPATH= cd -- "$1" && find . \( -type f -o -type l \) ! -name "$MARKER" ! -path "./$SELF_IGNORE" ! -name .DS_Store ! -name '._*' | LC_ALL=C sort \
     | while IFS= read -r f; do
         if [ -L "$f" ]; then printf 'L %s -> %s\n' "$f" "$(readlink "$f")"
         else printf 'F %s %s\n' "$f" "$([ -x "$f" ] && echo x)"; cat "$f"; fi
@@ -280,12 +282,14 @@ $files
 EOF
   hash=$(hash_tree "$tmp")
   printf 'source=%s\ncommit=%s\nhash=%s\n' "$src" "$state" "$hash" > "$tmp/$MARKER"
+  printf '*\n' > "$tmp/$SELF_IGNORE"
 
   why=
   present=0 # a dangling symlink counts too: it is something in the way
   if [ -e "$dest" ] || [ -L "$dest" ]; then present=1 why=$(blocker "$dest"); fi
   if [ $present = 1 ] && [ -z "$why" ] && [ "$(marker_get "$dest" hash)" = "$hash" ] && [ "$(marker_get "$dest" source)" = "$src" ]; then
     mv "$tmp/$MARKER" "$dest/$MARKER" # same content; record the current commit
+    mv "$tmp/$SELF_IGNORE" "$dest/$SELF_IGNORE" # and give a copy from an older setup its self-ignore
     rmtree "$tmp"
     say "unchanged  $(tilde "$dest")"
   else

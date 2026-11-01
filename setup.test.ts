@@ -124,6 +124,23 @@ describe("installing", () => {
     expect(marker).not.toContain("+uncommitted");
     expect(marker).toContain(`commit=${git(r, "rev-parse", "--short", "HEAD")}`);
   });
+
+  test("an installed copy ignores itself when the config dir is a git repo", () => {
+    repo([], { fake: "" });
+    git(claude(), "init", "-q");
+    expect(setup().code).toBe(0);
+    git(claude(), "add", "-A");
+    expect(git(claude(), "status", "--porcelain")).toBe("");
+    expect(git(claude(), "check-ignore", "skills/fake/SKILL.md")).toBe("skills/fake/SKILL.md");
+  });
+
+  test("an unchanged rerun gives a copy from an older setup its self-ignore", () => {
+    repo([], { fake: "" });
+    setup();
+    unlinkSync(join(skill("fake"), ".gitignore"));
+    expect(setup().out).toContain("unchanged");
+    expect(readFileSync(join(skill("fake"), ".gitignore"), "utf8")).toBe("*\n");
+  });
 });
 
 describe("never losing anything", () => {
@@ -238,6 +255,16 @@ describe("never losing anything", () => {
     expect(existsSync(join(skill("fake"), ".DS_Store"))).toBe(false);
     writeFileSync(join(skill("fake"), ".DS_Store"), "finder");
     expect(setup().out).toContain("unchanged");
+  });
+
+  test("only the top-level self-ignore is left out of edit detection", () => {
+    repo([], { fake: "" });
+    setup();
+    writeFileSync(join(skill("fake"), ".gitignore"), "mine\n");
+    expect(setup().out).toContain("unchanged");
+    expect(readFileSync(join(skill("fake"), ".gitignore"), "utf8")).toBe("*\n");
+    writeFileSync(join(skill("fake"), "Tools", ".gitignore"), "mine\n");
+    expect(setup().err).toContain("was edited after setup installed it");
   });
 
   test("a folder or shim setup did not write is refused, and --force backs it up", () => {
