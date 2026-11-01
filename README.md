@@ -20,7 +20,9 @@ Once `git-wt` is installed, later clones can use the worktree layout instead: `g
 
 `setup` copies each `skills/<name>/` to `~/.claude/skills/`, as `_<name>` when the machine runs LifeOS and as `<name>` otherwise (`--prefix` / `--no-prefix` override). It fills in `{{SKILL_NAME}}`, `{{SKILL_DIR}}` and `{{SOURCE_DIR}}`, writes shims such as `git-wt` to `~/.local/bin`, and checks the commands each skill needs. Each copy gets a `.gitignore` holding `*`, so a `~/.claude` that is itself a git repo never commits it.
 
-Missing commands are installed with pacman on Arch-family Linux and with Homebrew on macOS, after asking (`--yes` skips the question; without a terminal, setup prints the command instead). On any other system, or for something those managers can't provide, setup prints a prompt to paste into Claude Code and exits 2.
+Missing commands are installed with pacman on Arch-family Linux, apt on Debian-family Linux and Homebrew on macOS, after asking (`--yes` skips the question; without a terminal, setup prints the command instead). A tool the manager has no package for can use its own installer, which is how Debian gets bun, into `~/.local/bin`. For anything else, setup prints a prompt to paste into Claude Code and exits 2.
+
+`GitWorktree` needs git 2.48 and no Debian or Ubuntu release packages that yet, so on those systems setup ends at that prompt until you have a newer git.
 
 Rerun `setup` after every pull. It leaves unchanged skills alone and refuses to overwrite a copy that was edited in place, or anything it didn't install; `--force` moves those to `~/.local/state/claude-skills/backup/` instead of deleting them.
 
@@ -37,12 +39,12 @@ bun test                      # setup's own tests, plus every skill's
 Put it in `skills/<Name>/` with a `SKILL.md`, and an `install.conf` if it needs anything:
 
 ```
-require  <command> <min version|-> [arch=<package>] [brew=<package>]
-optional <command> <min version|-> [arch=<package>] [brew=<package>] -- <what it enables>
+require  <command> <min version|-> [arch=<package>] [apt=<package>] [brew=<package>] [script=<https url>] [prefix-env=<var>] [needs=<command,...>]
+optional <command> <min version|-> [same fields] -- <what it enables>
 bin      <name> <script, relative to the skill>
 ```
 
-A manager left out means it has no package for that command, so setup asks Claude to install it. `setup` itself never needs to change.
+A manager left out means it has no package for that command, so setup runs `script=` if there is one and otherwise asks Claude to install it. `prefix-env` names the variable that tells the script where to install, and `needs` lists what it runs besides curl. `setup` itself never needs to change.
 
 ## Personal details
 

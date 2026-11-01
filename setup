@@ -20,15 +20,18 @@ ignores itself in git, so a ~/.claude that is a repo never commits it.
   --force       replace installed copies edited in place, and files setup did
                 not write; they are moved to a backup folder, never deleted
 
-Missing commands come from pacman on Arch-family Linux and from Homebrew on
-macOS. Anywhere else, or for anything those can't provide, setup prints a
-prompt to paste into Claude Code and exits 2. Rerun after every pull.
+Missing commands come from pacman on Arch-family Linux, apt on Debian-family
+Linux and Homebrew on macOS, or from a tool's own installer where its install.conf
+names one and the manager has no package. For anything those can't provide, setup
+prints a prompt to paste into Claude Code and exits 2. Rerun after every pull.
 EOF
 }
 
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) # CDPATH could send cd elsewhere
 CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 BIN_DIR=${XDG_BIN_HOME:-$HOME/.local/bin}
+ORIG_PATH=$PATH # what the user's shell sees, for the warning at the end
+PATH=$BIN_DIR:$PATH # finds what an installer put here, and keeps that installer out of the shell's rc files
 BACKUP_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/claude-skills/backup
 OS_RELEASE=${SETUP_OS_RELEASE:-/etc/os-release} # tests point these two at fakes
 KERNEL=${SETUP_UNAME:-$(uname -s)}
@@ -75,13 +78,14 @@ conf() {
 
 # ---------------------------------------------------------------- dependencies
 
-# Package manager for this machine: pacman (Arch family), brew (macOS), or empty.
+# Package manager for this machine: pacman (Arch family), apt (Debian family), brew (macOS), or empty.
 manager() {
   if [ "$KERNEL" = Darwin ]; then
     if command -v brew >/dev/null 2>&1; then echo brew; fi
   else
     case " $ID $ID_LIKE " in
       *" arch "*) if command -v pacman >/dev/null 2>&1; then echo pacman; fi ;;
+      *" debian "*|*" ubuntu "*) if command -v apt-get >/dev/null 2>&1; then echo apt; fi ;;
     esac
   fi
 }
@@ -101,20 +105,23 @@ version_of() { "$1" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head 
 
 # Every dependency once, across all skills: parallel arrays, since bash 3.2 has no maps.
 # A command any skill requires is required; the highest minimum version wins.
-d_cmd=() d_req=() d_min=() d_arch=() d_brew=() d_why=() d_have=()
-add_dep() { # kind cmd min arch brew why
+d_cmd=() d_req=() d_min=() d_arch=() d_apt=() d_brew=() d_script=() d_prefix_env=() d_needs=() d_why=() d_have=()
+add_dep() { # kind cmd min arch apt brew script prefix_env needs why
   local i=0
   while [ $i -lt ${#d_cmd[@]} ]; do
     if [ "${d_cmd[i]}" = "$2" ]; then
       if [ "$1" = require ]; then d_req[i]=1; fi
       if [ "$3" != - ] && { [ "${d_min[i]}" = - ] || ! ver_ge "${d_min[i]}" "$3"; }; then d_min[i]=$3; fi
       if [ -z "${d_arch[i]}" ]; then d_arch[i]=$4; fi
-      if [ -z "${d_brew[i]}" ]; then d_brew[i]=$5; fi
+      if [ -z "${d_apt[i]}" ]; then d_apt[i]=$5; fi
+      if [ -z "${d_brew[i]}" ]; then d_brew[i]=$6; fi
+      if [ -z "${d_script[i]}" ]; then d_script[i]=$7 d_prefix_env[i]=$8 d_needs[i]=$9; fi
       return
     fi
     i=$((i + 1))
   done
-  d_cmd+=("$2"); d_min+=("$3"); d_arch+=("$4"); d_brew+=("$5"); d_why+=("$6")
+  d_cmd+=("$2"); d_min+=("$3"); d_arch+=("$4"); d_apt+=("$5"); d_brew+=("$6")
+  d_script+=("$7"); d_prefix_env+=("$8"); d_needs+=("$9"); d_why+=("${10}")
   if [ "$1" = require ]; then d_req+=(1); else d_req+=(0); fi
 }
 
@@ -124,18 +131,23 @@ for s in "${skills[@]}"; do
       require|optional)
         set -f; set -- $rest; set +f # split on spaces, but never expand * or ? against the cwd
         [ $# -ge 2 ] || die "skills/$s/install.conf: '$kind $rest' needs <command> <min version|->"
-        cmd=$1 min=$2 arch= brew= why=
+        cmd=$1 min=$2 arch= apt= brew= script= prefix_env= needs= why=
         shift 2
         while [ $# -gt 0 ]; do
           case $1 in
             arch=*) arch=${1#arch=} ;;
+            apt=*) apt=${1#apt=} ;;
             brew=*) brew=${1#brew=} ;;
+            script=https://*) script=${1#script=} ;;
+            script=*) die "skills/$s/install.conf: script must be an https URL in: $kind $rest" ;;
+            prefix-env=*) prefix_env=${1#prefix-env=} ;;
+            needs=*) needs=${1#needs=} ;;
             --) shift; why=$*; break ;;
             *) die "skills/$s/install.conf: unexpected '$1' in: $kind $rest" ;;
           esac
           shift
         done
-        add_dep "$kind" "$cmd" "$min" "$arch" "$brew" "$why"
+        add_dep "$kind" "$cmd" "$min" "$arch" "$apt" "$brew" "$script" "$prefix_env" "$needs" "$why"
         ;;
       bin) ;;
       *) die "skills/$s/install.conf: unknown entry '$kind'" ;;
@@ -167,42 +179,98 @@ describe_dep() { # missing index -> "bun >= 1.1 (required; found: 1.0.3 at /usr/
   printf ' (%s; found: %s)' "$what" "${d_have[i]}"
 }
 
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+installer_line() { # dep index -> the installer as one copy-pastable command
+  printf 'curl -fsSL %s | %sbash' "${d_script[$1]}" "${d_prefix_env[$1]:+${d_prefix_env[$1]}=$(tilde "$(dirname "$BIN_DIR")") }"
+}
+# Downloads first, so a dropped connection can never run half a script. Stdin closed so it can't
+# eat setup's. A prefix-env installer lands in the parent of BIN_DIR, in its bin/.
+run_installer() { # dep index
+  local i=$1 f n
+  for n in curl ${d_needs[i]//,/ }; do
+    if ! have_cmd "$n"; then warn "not running the ${d_cmd[i]} installer: $n is missing"; return 0; fi
+  done
+  f=$(mktemp)
+  say "running: $(installer_line "$i")"
+  if curl --proto '=https' -fsSL "${d_script[i]}" -o "$f"; then
+    env ${d_prefix_env[i]:+"${d_prefix_env[i]}=$(dirname "$BIN_DIR")"} bash "$f" </dev/null || warn "the ${d_cmd[i]} installer failed; see above"
+  else
+    warn "could not download the ${d_cmd[i]} installer from ${d_script[i]}"
+  fi
+  rm -f "$f"
+}
+
 check_deps
 mgr=$(manager)
 pm_ran=0
-if [ ${#missing[@]} -gt 0 ] && [ -n "$mgr" ]; then
-  pkgs=()
-  for i in "${missing[@]}"; do
-    if [ "$mgr" = pacman ]; then p=${d_arch[i]}; else p=${d_brew[i]}; fi
-    if [ -n "$p" ]; then pkgs+=("$p"); fi
-  done
+# A package when the manager has one; otherwise the tool's installer, whose own needs the
+# manager can supply (they share the command's name in every manager's package list so far).
+pkgs=() scripts=()
+for i in "${missing[@]}"; do
+  case $mgr in
+    pacman) p=${d_arch[i]} ;;
+    apt) p=${d_apt[i]} ;;
+    brew) p=${d_brew[i]} ;;
+    *) p= ;;
+  esac
+  if [ -n "$p" ]; then
+    pkgs+=("$p")
+  elif [ -n "${d_script[i]}" ]; then
+    ready=1
+    for n in curl ${d_needs[i]//,/ }; do
+      if have_cmd "$n"; then continue; fi
+      if [ -z "$mgr" ]; then ready=0; continue; fi
+      case " ${pkgs[*]} " in *" $n "*) ;; *) pkgs+=("$n") ;; esac
+    done
+    if [ $ready = 1 ]; then scripts+=("$i"); fi
+  fi
+done
+if [ ${#pkgs[@]} -gt 0 ] || [ ${#scripts[@]} -gt 0 ]; then
+  as_root=()
+  if [ "$(id -u)" != 0 ]; then as_root=(sudo); fi
+  refresh=() run=()
   if [ ${#pkgs[@]} -gt 0 ]; then
-    if [ "$mgr" = pacman ]; then
-      run=(pacman -S --needed "${pkgs[@]}")
-      if [ "$(id -u)" != 0 ]; then run=(sudo "${run[@]}"); fi
-    else
-      run=(brew install "${pkgs[@]}")
+    case $mgr in
+      pacman) run=("${as_root[@]}" pacman -S --needed "${pkgs[@]}") ;;
+      apt) # a fresh machine has no package lists yet; -y because setup already asked
+        refresh=("${as_root[@]}" apt-get update)
+        run=("${as_root[@]}" apt-get install -y "${pkgs[@]}") ;;
+      brew) run=(brew install "${pkgs[@]}") ;;
+    esac
+  fi
+  plan=()
+  if [ ${#refresh[@]} -gt 0 ]; then plan+=("${refresh[*]}"); fi
+  if [ ${#run[@]} -gt 0 ]; then plan+=("${run[*]}"); fi
+  for i in "${scripts[@]}"; do plan+=("$(installer_line "$i")"); done
+  say "missing:"
+  for i in "${missing[@]}"; do say "  $(describe_dep "$i")"; done
+  go=$yes asked=0
+  if [ $go = 0 ] && [ -t 0 ]; then
+    say "to install them, setup would run:"
+    for line in "${plan[@]}"; do say "  $line"; done
+    printf 'go ahead? [Y/n] '
+    read -r answer || answer=n
+    asked=1
+    case $answer in ''|y|Y|yes) go=1 ;; esac
+  fi
+  if [ $go = 1 ]; then
+    if [ ${#refresh[@]} -gt 0 ]; then
+      say "running: ${refresh[*]}"
+      "${refresh[@]}" || warn "${refresh[0]} failed; see above"
     fi
-    say "missing:"
-    for i in "${missing[@]}"; do say "  $(describe_dep "$i")"; done
-    go=$yes asked=0
-    if [ $go = 0 ] && [ -t 0 ]; then
-      printf 'run: %s ? [Y/n] ' "${run[*]}"
-      read -r answer || answer=n
-      asked=1
-      case $answer in ''|y|Y|yes) go=1 ;; esac
-    fi
-    if [ $go = 1 ]; then
+    if [ ${#run[@]} -gt 0 ]; then
       say "running: ${run[*]}"
       "${run[@]}" || warn "${run[0]} failed; see above"
       pm_ran=1
-      hash -r
-      check_deps
-    else
-      if [ $asked = 1 ]; then say "skipped; run this yourself, or rerun with --yes:"
-      else say "not installing anything without a terminal to ask in; run this yourself, or rerun with --yes:"; fi
-      say "  ${run[*]}"
     fi
+    hash -r
+    for i in "${scripts[@]}"; do run_installer "$i"; done
+    hash -r
+    check_deps
+  else
+    if [ $asked = 1 ]; then say "skipped; run this yourself, or rerun with --yes:"
+    else say "not installing anything without a terminal to ask in; run this yourself, or rerun with --yes:"; fi
+    for line in "${plan[@]}"; do say "  $line"; done
   fi
 fi
 
@@ -326,9 +394,9 @@ EOF
   done < <(conf "$s")
 done
 
-case ":$PATH:" in
+case ":$ORIG_PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) warn "$(tilde "$BIN_DIR") is not on PATH, so the shims won't be found. fish: fish_add_path $(tilde "$BIN_DIR"); bash/zsh: export PATH=\"$(tilde "$BIN_DIR"):\$PATH\"" ;;
+  *) warn "$(tilde "$BIN_DIR") is not on PATH, so the shims won't be found. fish: fish_add_path $(tilde "$BIN_DIR"); bash/zsh: export PATH=\"$(tilde "$BIN_DIR" | sed 's/^~/$HOME/'):\$PATH\"" ;;
 esac
 
 # ---------------------------------------------------------------- report
@@ -361,8 +429,9 @@ Missing or too old:
 EOF
 for i in "${missing[@]}"; do
   printf -- '- %s' "$(describe_dep "$i")"
-  set -- ${d_arch[i]:+arch=${d_arch[i]}} ${d_brew[i]:+brew=${d_brew[i]}}
+  set -- ${d_arch[i]:+arch=${d_arch[i]}} ${d_apt[i]:+apt=${d_apt[i]}} ${d_brew[i]:+brew=${d_brew[i]}}
   if [ $# -gt 0 ]; then printf ' [package: %s]' "$*"; fi
+  if [ -n "${d_script[i]}" ]; then printf ' [installer: %s]' "${d_script[i]}"; fi
   printf '\n'
 done
 cat <<EOF

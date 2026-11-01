@@ -350,6 +350,159 @@ describe("dependencies", () => {
     expect(r.out).toContain(`${join(t, "repo")}/setup again`);
   });
 
+  describe("Debian family", () => {
+    const aptConf = "require zzz-nope 1.0 apt=zzz-apt\nrequire git 2.0 apt=git\n";
+
+    test("without a terminal: prints the refresh and the install, runs nothing, exits 2", () => {
+      os("debian", "", "Debian GNU/Linux 13");
+      fakes("sudo", "apt-get");
+      repo([], { fake: aptConf });
+      const r = setup();
+      expect(r.code).toBe(2);
+      expect(r.out).toContain("sudo apt-get update\n");
+      expect(r.out).toContain("sudo apt-get install -y zzz-apt\n");
+      expect(fakeLog()).toBe("");
+      expect(existsSync(skill("fake"))).toBe(true);
+    });
+
+    test("with --yes: refreshes the package lists, then installs through sudo", () => {
+      os("debian");
+      fakes("sudo", "apt-get");
+      repo([], { fake: aptConf });
+      const r = setup(["--yes"]);
+      expect(fakeLog()).toBe("sudo apt-get update\nsudo apt-get install -y zzz-apt\n");
+      expect(r.code).toBe(2); // the fake installed nothing
+      expect(r.out).toContain("package manager ran and they are still missing");
+    });
+
+    test("Ubuntu and its derivatives count", () => {
+      for (const [id, like] of [["ubuntu", "debian"], ["linuxmint", "ubuntu"]]) {
+        os(id!, like!);
+        fakes("apt-get");
+        repo([], { fake: aptConf });
+        expect(setup().out).toContain("apt-get install -y zzz-apt");
+      }
+    });
+
+    test.skipIf(Bun.which("apt-get"))("a machine without apt-get has no manager, whatever os-release says", () => {
+      os("debian");
+      repo([], { fake: aptConf });
+      const r = setup();
+      expect(r.out).toContain("Package manager setup found: none it knows");
+      expect(r.out).toContain("[package: apt=zzz-apt]");
+    });
+  });
+
+  describe("installer scripts", () => {
+    const url = "https://example.invalid/install";
+    const scriptConf = `require zzz-nope 1.0 script=${url} prefix-env=ZZZ_HOME needs=zzz-need\n`;
+    const script = (name: string, body: string) => {
+      writeFileSync(join(t, "fake", name), `#!/bin/sh\n${body}\n`);
+      chmodSync(join(t, "fake", name), 0o755);
+    };
+    const log = () => `>> "${join(t, "fake", "log")}"`;
+    /** A curl that "downloads" an installer putting a working zzz-nope in $ZZZ_HOME/bin. */
+    const fakeCurl = () => {
+      const installer = `#!/bin/sh\necho "installer ZZZ_HOME=$ZZZ_HOME" ${log()}\nmkdir -p "$ZZZ_HOME/bin"\nprintf '#!/bin/sh\\necho zzz-nope 1.5\\n' > "$ZZZ_HOME/bin/zzz-nope"\nchmod +x "$ZZZ_HOME/bin/zzz-nope"\n`;
+      writeFileSync(join(t, "installer"), installer);
+      script("curl", `echo "curl fetched" ${log()}\nfor a in "$@"; do out=$a; done\ncp "${join(t, "installer")}" "$out"`);
+    };
+    const need = () => script("zzz-need", "exit 0");
+
+    test("apt supplies what the installer needs, then the installer lands in BIN_DIR and setup finishes", () => {
+      os("debian");
+      fakeCurl();
+      script("apt-get", `echo "apt-get $*" ${log()}\ncase $1 in install) printf '#!/bin/sh\\n' > "${join(t, "fake", "zzz-need")}"; chmod +x "${join(t, "fake", "zzz-need")}" ;; esac`);
+      script("sudo", `echo "sudo $*" ${log()}\nexec "$@"`);
+      repo([], { fake: scriptConf });
+      const r = setup(["--yes"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("every required command present");
+      expect(fakeLog()).toBe(
+        `sudo apt-get update\napt-get update\nsudo apt-get install -y zzz-need\napt-get install -y zzz-need\ncurl fetched\ninstaller ZZZ_HOME=${t}\n`,
+      );
+      expect(existsSync(join(t, "bin", "zzz-nope"))).toBe(true);
+    });
+
+    test("nothing runs without consent; the printed command can be pasted", () => {
+      os("debian");
+      fakeCurl();
+      need();
+      repo([], { fake: scriptConf });
+      const r = setup();
+      expect(r.code).toBe(2);
+      expect(r.out).toContain(`curl -fsSL ${url} | ZZZ_HOME=${t} bash`);
+      expect(fakeLog()).toBe("");
+      expect(r.out).toContain(`[installer: ${url}]`);
+    });
+
+    test("a manager with a package wins over the installer", () => {
+      os("arch");
+      fakeCurl();
+      need();
+      fakes("sudo", "pacman");
+      repo([], { fake: `require zzz-nope 1.0 arch=zzz-pkg script=${url}\n` });
+      setup(["--yes"]);
+      expect(fakeLog()).toBe("sudo pacman -S --needed zzz-pkg\n");
+    });
+
+    test("a failed download never runs anything, and ends at the Claude prompt", () => {
+      os("debian");
+      need();
+      script("curl", `echo "curl failed" ${log()}\nexit 22`);
+      repo([], { fake: scriptConf });
+      const r = setup(["--yes"]);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain(`could not download the zzz-nope installer from ${url}`);
+      expect(fakeLog()).toBe("curl failed\n");
+      expect(r.out).toContain("Paste this into Claude Code");
+    });
+
+    test("a failing installer is reported, and rechecked", () => {
+      os("debian");
+      need();
+      writeFileSync(join(t, "installer"), "#!/bin/sh\nexit 7\n");
+      script("curl", `for a in "$@"; do out=$a; done\ncp "${join(t, "installer")}" "$out"`);
+      repo([], { fake: scriptConf });
+      const r = setup(["--yes"]);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain("the zzz-nope installer failed");
+    });
+
+    test("an unknown distro runs it when its needs are there, and leaves it to Claude when they aren't", () => {
+      os("gentoo");
+      fakeCurl();
+      repo([], { fake: scriptConf });
+      const without = setup(["--yes"]);
+      expect(without.code).toBe(2);
+      expect(fakeLog()).toBe("");
+      need();
+      expect(setup(["--yes"]).code).toBe(0);
+      expect(fakeLog()).toContain("installer");
+    });
+
+    test("a rerun finds what the installer put in BIN_DIR even when it isn't on the user's PATH", () => {
+      os("debian");
+      fakeCurl();
+      need();
+      repo([], { fake: scriptConf });
+      const path = `${join(t, "fake")}:${process.env.PATH}`;
+      const first = setup(["--yes"], { PATH: path });
+      expect(first.code).toBe(0);
+      expect(first.err).toContain("is not on PATH");
+      const before = fakeLog();
+      expect(setup(["--yes"], { PATH: path }).code).toBe(0);
+      expect(fakeLog()).toBe(before);
+    });
+
+    test("a script that isn't https is refused", () => {
+      repo([], { fake: "require zzz-nope 1.0 script=http://example.invalid/i\n" });
+      const r = setup();
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("script must be an https URL");
+    });
+  });
+
   test("a command that is present but too old counts as missing, with the version found", () => {
     os("gentoo");
     repo([], { fake: "require git 99.0 arch=git\n" });
