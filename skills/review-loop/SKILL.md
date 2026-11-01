@@ -1,6 +1,6 @@
 ---
 name: review-loop
-description: Multi-round code review in two phases, simplicity first and correctness second. Each round starts a fresh read-only reviewer subagent. The main agent triages its findings, asks the user about each one with suggested fixes (the user can also write their own), applies the chosen fixes and starts the next round. "soft" runs 1 simplicity + 1 correctness round (the default); "strong" runs 2 + 2. By default it reviews the current branch (commits plus uncommitted changes) against main/master. USE WHEN review loop, review my changes, simplicity review, correctness review, strong review, soft review, review this branch, review before PR. NOT FOR a single one-shot review with no fixes applied.
+description: Multi-round code review in two phases, simplicity first and correctness second. Each round starts a fresh read-only reviewer subagent. The main agent triages its findings, asks the user about each one with suggested fixes (the user can also write their own), applies the chosen fixes and starts the next round. "soft" (also weak, short, quick) runs 1 simplicity + 1 correctness round (the default); "strong" (also hard, long, detailed) runs 2 + 2. By default it reviews the current branch (commits plus uncommitted changes) against main/master. USE WHEN review loop, review my changes, simplicity review, correctness review, strong review, hard review, long review, detailed review, soft review, weak review, short review, quick review, review this branch, review before PR. NOT FOR a single one-shot review with no fixes applied, or applying fixes without being asked (use auto-review).
 argument-hint: "[soft|strong] [uncommitted | vs <branch> | <paths...>]"
 ---
 
@@ -14,7 +14,7 @@ This skill only uses git and Claude Code's built-in tools (`Agent`, `AskUserQues
 
 From `$ARGUMENTS`:
 
-- **Depth:** `strong` means 2 simplicity rounds, then 2 correctness rounds. `soft` means 1 + 1. If neither is given, use `soft`.
+- **Depth:** `strong` (also `hard`, `long`, `detailed`) means 2 simplicity rounds, then 2 correctness rounds. `soft` (also `weak`, `short`, `quick`) means 1 + 1. If neither is given, use `soft`. A bare depth word is always the depth, even if a file has that name; write `./quick` to target the file.
 - **Target:** the default is **branch vs base**. `uncommitted` (also "uncommitted files", "working tree") means **uncommitted only**. `vs <ref>` or `base <ref>` means **branch vs** the named ref. Anything that looks like file or directory paths means **paths**.
 
 ## 2. Resolve the target once and freeze it
