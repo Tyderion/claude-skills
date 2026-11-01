@@ -22,7 +22,7 @@ Once `git-wt` is installed, later clones can use the worktree layout instead: `g
 
 Missing commands are installed with pacman on Arch-family Linux, apt on Debian-family Linux and Homebrew on macOS, after asking (`--yes` skips the question; without a terminal, setup prints the command instead). A tool the manager has no package for can use its own installer, which is how Debian gets bun, into `~/.local/bin`. For anything else, setup prints a prompt to paste into Claude Code and exits 2.
 
-`GitWorktree` needs git 2.48 and no Debian or Ubuntu release packages that yet, so on those systems setup ends at that prompt until you have a newer git.
+`GitWorktree` needs git 2.48. Ubuntu 26.04 and later package that, so setup finishes cleanly there. Debian 13 and older and Ubuntu 24.04 and older don't, so setup ends at that prompt until you have a newer git; with one, they finish cleanly too.
 
 Rerun `setup` after every pull. It leaves unchanged skills alone and refuses to overwrite a copy that was edited in place, or anything it didn't install; `--force` moves those to `~/.local/state/claude-skills/backup/` instead of deleting them.
 
