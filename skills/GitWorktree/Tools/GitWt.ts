@@ -13,7 +13,7 @@
  */
 import { execFile, spawnSync } from "node:child_process";
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync,
+  existsSync, lstatSync, mkdirSync, readFileSync, readSync, readdirSync, readlinkSync, realpathSync,
   renameSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -56,7 +56,7 @@ const USAGE = `git-wt — bare-repo worktree containers
       worktree's copy of a [copy] entry with the root default. Plans first; any
       conflict aborts the whole sync with nothing changed.
 
-  git-wt prune [--yes] [--gone] [-C <container>]
+  git-wt prune [--yes] [--gone] [-i] [-C <container>]
       Find dead local branches and worktrees: fetch --prune, then ask gh which
       branches have a merged PR containing their tip, which works for squash merges.
       Lists every local branch with the reason it would be deleted or kept, and
@@ -69,6 +69,10 @@ const USAGE = `git-wt — bare-repo worktree containers
       a process running in it. Never touched: the default branch (.bare/HEAD and every
       remote's HEAD) and its worktree, and branches a worktree is rebasing or bisecting,
       or has checked out with its folder missing.
+      -i (--interactive) then offers every other branch by number, merged or not, with
+      what deleting it loses, and deletes the ones you pick and confirm, worktree and
+      uncommitted work included. Only locked worktrees are held back. With --yes the
+      merged ones go first and the rest are offered.
 
   git-wt open <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]
       Get <branch>'s worktree ready and print its path, alone, on stdout (the rest
@@ -494,11 +498,16 @@ function notReusable(container: string, wt: Worktree): string | undefined {
   for (const f of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG"]) {
     if (existsSync(resolve(wt.path, git(wt.path, "rev-parse", "--git-path", f)))) return `has an operation in progress (${f})`;
   }
+  const dirty = uncommitted(container, wt);
+  return dirty.length ? `has uncommitted changes or untracked files:\n  ${dirty.join("\n  ")}` : undefined;
+}
+
+/** `git status` lines for a worktree, leaving out shared paths, which are git-wt's own. */
+function uncommitted(container: string, wt: Worktree): string[] {
   const { link, copy } = readShared(container);
   const ours = [...link, ...copy];
-  const dirty = git(wt.path, "status", "--porcelain").split("\n").filter(Boolean)
+  return git(wt.path, "status", "--porcelain").split("\n").filter(Boolean)
     .filter((l) => !ours.some((p) => l.slice(3).replace(/\/$/, "") === p || l.slice(3).startsWith(p + "/")));
-  return dirty.length ? `has uncommitted changes or untracked files:\n  ${dirty.join("\n  ")}` : undefined;
 }
 
 /** Paths present in `dir` but untracked there (ignored files, shared links and copies) that
@@ -695,19 +704,69 @@ function dropReused(container: string, branch: string, tip: string) {
 function notRemovable(container: string, wt: Worktree): string | undefined {
   const why = notReusable(container, wt);
   if (why) return why.split("\n")[0].replace(/:$/, "");
+  return ownShared(container, wt)[0] ?? processIn(wt);
+}
+
+/** A worktree's own versions of shared paths, which go with the folder. */
+function ownShared(container: string, wt: Worktree): string[] {
   const { link, copy } = readShared(container);
+  const own: string[] = [];
   for (const p of link) {
     const st = lstatOrNull(join(wt.path, p));
-    if (st && !st.isSymbolicLink()) return `has its own ${p} where a shared link belongs`;
+    if (st && !st.isSymbolicLink()) own.push(`has its own ${p} where a shared link belongs`);
   }
   for (const p of copy) {
-    if (lstatOrNull(join(wt.path, p)) && !run("diff", ["-rq", "--no-dereference", join(container, p), join(wt.path, p)], undefined, true).ok) return `has its own version of ${p}`;
+    if (lstatOrNull(join(wt.path, p)) && !run("diff", ["-rq", "--no-dereference", join(container, p), join(wt.path, p)], undefined, true).ok) own.push(`has its own version of ${p}`);
   }
+  return own;
+}
+
+function processIn(wt: Worktree): string | undefined {
   // lsof exits 1 when it merely couldn't read some processes, so only a failed spawn means no answer.
   const lsof = spawnSync("lsof", ["-nP", "-d", "cwd", "-Fn"], { encoding: "utf8", maxBuffer: 1 << 28 });
   if (lsof.error) return `may have a process running in it (cannot run lsof: ${lsof.error.message})`;
   const inIt = (dir: string) => dir === wt.path || dir.startsWith(wt.path + sep);
   if (lsof.stdout.split("\n").some((l) => l.startsWith("n") && inIt(l.slice(1)))) return "has a process running in it";
+}
+
+/** What deleting a branch and its worktree gives up. Commits on a merged branch are in its PR, and
+ *  ignored files aren't listed: those go with every removal. */
+function losses(container: string, tip: string, wt: Worktree | undefined, merged: boolean): string[] {
+  const plural = (n: number, what: string) => `${n} ${what}${n === 1 ? "" : "s"}`;
+  const lost: string[] = [];
+  const commits = merged ? 0 : Number(git(container, "rev-list", "--count", tip, "--not", "--remotes"));
+  if (commits) lost.push(`${plural(commits, "commit")} on no remote branch`);
+  if (!wt) return lost;
+  const files = uncommitted(container, wt).length;
+  if (files) lost.push(plural(files, "uncommitted file"));
+  lost.push(...ownShared(container, wt));
+  const process = processIn(wt);
+  if (process) lost.push(process);
+  return lost;
+}
+
+/** One line from stdin, or undefined at its end. A byte at a time, so nothing past the line is consumed. */
+function readLine(): string | undefined {
+  const bytes: number[] = [];
+  const byte = Buffer.alloc(1);
+  while (readSync(0, byte, 0, 1, null)) {
+    if (byte[0] === 10) return Buffer.from(bytes).toString();
+    bytes.push(byte[0]);
+  }
+  return bytes.length ? Buffer.from(bytes).toString() : undefined;
+}
+
+/** "1 3,5-7" as sorted numbers. Throws on anything but numbers and ranges within 1..max. */
+export function parsePicks(text: string, max: number): number[] {
+  const picks = new Set<number>();
+  for (const part of text.split(/[\s,]+/).filter(Boolean)) {
+    const m = /^(\d+)(?:-(\d+))?$/.exec(part);
+    if (!m) throw new Fail(`"${part}" is not a number or a range`);
+    const [from, to] = [Number(m[1]), Number(m[2] ?? m[1])];
+    if (from < 1 || to > max || from > to) throw new Fail(`${part} is not within 1-${max}`);
+    for (let n = from; n <= to; n++) picks.add(n);
+  }
+  return [...picks].sort((a, b) => a - b);
 }
 
 const prRef = (p: Proof) => `${p.repo}#${p.pr}${p.base ? ` into ${p.base}` : ""}`;
@@ -776,7 +835,8 @@ const removeEmpty = (dir: string): void => {
   rmdirSync(dir);
 };
 
-export async function prune(container: string, { yes = false, gone = false } = {}): Promise<void> {
+export async function prune(container: string, { yes = false, gone = false, interactive = false } = {}): Promise<void> {
+  const cwd = process.cwd();
   // No `git worktree prune`: it drops the registration of a worktree whose folder is only missing
   // for now (an unmounted volume), which would free its branch for deletion.
   const fetched = gitTry(container, "fetch", "--all", "--prune", "--quiet");
@@ -822,7 +882,7 @@ export async function prune(container: string, { yes = false, gone = false } = {
     const v = verdicts.get(b.name);
     const wt = held.get(b.name);
     if (!v) kept.push([b, defaults.get(b.name) ?? busy.get(b.name)!]);
-    else if (wt && !v.proof) kept.push([b, busy.get(b.name)!]);
+    else if (wt && !v.proof) kept.push([b, `${busy.get(b.name)}${wt.locked ? ", locked" : ""}`]);
     else if (wt) {
       const folder = `${basename(wt.path)}/`;
       const pr = `merged in ${prRef(v.proof!)}`;
@@ -841,7 +901,8 @@ export async function prune(container: string, { yes = false, gone = false } = {
   }
 
   const failed: string[] = [];
-  const drop = (b: Branch, why: string) => {
+  /** `picked`: a person chose this branch knowing these losses, so uncommitted work may go too. */
+  const drop = (b: Branch, why: string, picked?: string[]) => {
     // The gh calls took a while; a branch that moved since is not the one that was checked.
     if (gitTry(container, "rev-parse", "--verify", "--quiet", `refs/heads/${b.name}`).out !== b.tip) {
       return void failed.push(`${b.name}: moved since prune read it at ${b.short}; left alone`);
@@ -851,12 +912,18 @@ export async function prune(container: string, { yes = false, gone = false } = {
       const folder = `${basename(wt.path)}/`;
       const now = worktrees(container).find((w) => w.path === wt.path);
       if (now?.branch !== b.name) return void failed.push(`${folder}: no longer on ${b.name}; left alone`);
-      const why = notRemovable(container, wt);
-      if (why) return void failed.push(`${folder}: ${why} since prune read it; left alone`);
-      // Never --force: git's own refusal is the last check that nothing but ignored files goes.
-      const removed = gitTry(container, "worktree", "remove", wt.path);
+      if (picked) {
+        const now = losses(container, b.tip, wt, Boolean(verdicts.get(b.name)?.proof));
+        if (now.join() !== picked.join()) return void failed.push(`${folder}: changed since you picked it (now: ${now.join(", ") || "nothing to lose"}); left alone`);
+      } else {
+        const why = notRemovable(container, wt);
+        if (why) return void failed.push(`${folder}: ${why} since prune read it; left alone`);
+      }
+      // Without --force, git's own refusal is the last check that nothing but ignored files goes.
+      const removed = gitTry(container, "worktree", "remove", ...(picked ? ["--force"] : []), wt.path);
       if (!removed.ok) return void failed.push(`${folder}: ${removed.err.trim()}`);
       log(`removed worktree ${folder}`);
+      if (cwd === wt.path || cwd.startsWith(wt.path + sep)) log(`your shell's directory is gone; run: cd ${JSON.stringify(container)}`);
     }
     const r = gitTry(container, "branch", "-D", b.name);
     if (r.ok) log(`deleted ${b.name} (was ${b.short}; ${why})`);
@@ -868,10 +935,37 @@ export async function prune(container: string, { yes = false, gone = false } = {
   };
 
   if (yes) for (const [b, why] of merged) drop(b, why);
-  else list("deleted by --yes", merged);
+  else if (!interactive) list("deleted by --yes", merged);
   if (yes && gone) for (const [b, why] of goneOnly) drop(b, why);
-  else list(yes ? "kept without --gone" : "deleted by --yes --gone", goneOnly);
-  list("kept", kept);
+  else if (!interactive) list(yes ? "kept without --gone" : "deleted by --yes --gone", goneOnly);
+  if (interactive) {
+    // Defaults stay out, and so do branches git holds for a reason a person should clear first.
+    const offerable = ([b]: [Branch, string]) => verdicts.has(b.name) && !held.get(b.name)?.locked;
+    list("kept", kept.filter((row) => !offerable(row)));
+    const rest = kept.filter(offerable);
+    const offered = [...(yes ? [] : merged), ...(yes && gone ? [] : goneOnly), ...rest.filter(([b]) => held.has(b.name)), ...rest.filter(([b]) => !held.has(b.name))]
+      .map(([b, why]) => ({ b, why, lost: losses(container, b.tip, held.get(b.name), Boolean(verdicts.get(b.name)?.proof)) }));
+    const row = (o: (typeof offered)[number]) => `${o.b.name.padEnd(width)}  ${o.b.short}  ${o.why}${o.lost.length ? `  [loses: ${o.lost.join(", ")}]` : ""}`;
+    if (offered.length) {
+      log(`pick what to delete (${offered.length}):\n${offered.map((o, i) => `${String(i + 1).padStart(4)}  ${row(o)}`).join("\n")}`);
+      let picks: number[] | undefined;
+      while (!picks) {
+        process.stdout.write("Numbers to delete, like 1 3 5-7 (Enter for none): ");
+        try {
+          picks = parsePicks(readLine() ?? "", offered.length);
+        } catch (e) {
+          if (!(e instanceof Fail)) throw e;
+          log(e.message);
+        }
+      }
+      if (picks.length) {
+        log(`about to delete, worktrees and ignored files included:\n${picks.map((n) => `  ${row(offered[n - 1])}`).join("\n")}`);
+        process.stdout.write(`Delete ${picks.length === 1 ? "this" : `these ${picks.length}`}? Type yes: `);
+        if (readLine()?.trim() === "yes") for (const n of picks) drop(offered[n - 1].b, offered[n - 1].why, offered[n - 1].lost);
+        else log("nothing picked was deleted");
+      }
+    }
+  } else list("kept", kept);
 
   // Folders here that aren't worktrees: what git worktree remove leaves when something wrote into
   // the folder after removal. Empty ones go; anything with files is left for a person to look at.
@@ -897,7 +991,7 @@ export async function prune(container: string, { yes = false, gone = false } = {
   }
 
   if (failed.length) fail(`could not delete:\n  ${failed.join("\n  ")}`);
-  if (yes) return;
+  if (yes || interactive) return;
   if (merged.length || goneOnly.length || emptyFound) log("nothing changed; the lists above say what --yes and --yes --gone delete");
 }
 
@@ -1221,7 +1315,7 @@ const OPTIONS = {
   add: { from: str, remote: str, fresh: { type: "boolean" }, C: container },
   reuse: { from: str, remote: str, C: container },
   sync: { reset: str, C: container },
-  prune: { yes: { type: "boolean" }, gone: { type: "boolean" }, C: container },
+  prune: { yes: { type: "boolean" }, gone: { type: "boolean" }, interactive: { type: "boolean", short: "i" }, C: container },
   open: { from: str, remote: str, fresh: { type: "boolean" }, C: container },
 } as const;
 
@@ -1256,8 +1350,8 @@ function main(argv: string[]) {
       if (pos.length) fail("usage: git-wt sync [--reset <path>] [-C <container>]");
       return reportSync(sync(findContainer(flags.C ?? process.cwd()), { reset: flags.reset }));
     case "prune":
-      if (pos.length) fail("usage: git-wt prune [--yes] [--gone] [-C <container>]");
-      return prune(findContainer(flags.C ?? process.cwd()), { yes: Boolean(values.yes), gone: Boolean(values.gone) });
+      if (pos.length) fail("usage: git-wt prune [--yes] [--gone] [-i] [-C <container>]");
+      return prune(findContainer(flags.C ?? process.cwd()), { yes: Boolean(values.yes), gone: Boolean(values.gone), interactive: Boolean(values.interactive) });
     case "open": {
       if (pos.length !== 1) fail("usage: git-wt open <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]");
       return void console.log(open(findContainer(flags.C ?? process.cwd()), pos[0], { from: flags.from, remote: flags.remote, fresh: Boolean(values.fresh) }));

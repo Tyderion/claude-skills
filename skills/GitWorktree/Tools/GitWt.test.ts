@@ -1,10 +1,11 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const TOOL = join(import.meta.dir, "GitWt.ts");
+const { parsePicks } = await import(TOOL);
 const env = {
   ...process.env,
   GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com",
@@ -1378,6 +1379,148 @@ describe("prune removes merged worktrees", () => {
     expect(r.out).toContain("reusing w-spare/");
     expect(existsSync(folder("w/next"))).toBe(true);
     expect(existsSync(folder("w/spare"))).toBe(false);
+  });
+});
+
+describe("prune -i", () => {
+  setDefaultTimeout(30_000); // these run prune several times, and each run scans processes per worktree
+  let c: string;
+  let g: FakeGh;
+  const folder = (b: string) => join(c, b.replace(/\//g, "-"));
+  const has = (b: string) => sh("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${b}`], c).code === 0;
+  /** prune with `input` typed at its prompts; `cwd` is where it runs. */
+  const pick = (input: string, args: string[] = ["-i"], cwd = c) => {
+    const r = spawnSync("bun", [TOOL, "prune", ...args], { cwd, env: { ...env, ...g.env }, input, encoding: "utf8" });
+    return { code: r.status, out: r.stdout.trim(), err: r.stderr.trim() };
+  };
+  /** The number prune -i gave a branch, or undefined when it didn't offer it. */
+  const num = (out: string, b: string) => /^ *(\d+)  (\S+) /m.test(out)
+    ? [...out.matchAll(/^ *(\d+)  (\S+) /gm)].find((m) => m[2] === b)?.[1]
+    : undefined;
+  const offeredLine = (out: string, b: string) => out.split("\n").find((l) => new RegExp(`^ *\\d+  ${b} `).test(l)) ?? "";
+  function tree(b: string) {
+    expect(sh("bun", [TOOL, "add", b, "--fresh"], c, g.env).code).toBe(0);
+    writeFileSync(join(folder(b), `${b.replace(/\//g, "-")}.txt`), "w\n");
+    git(folder(b), "add", "."); git(folder(b), "commit", "-qm", b);
+  }
+
+  beforeAll(() => {
+    const bare = makeRemote("prune-i-r");
+    c = join(root, "prunei");
+    expect(wt(root, "clone", bare, "--dir", c).code).toBe(0);
+    const url = "https://github.com/t/prunei.git";
+    git(c, "config", `url.${bare}.insteadOf`, url);
+    git(c, "remote", "set-url", "origin", url);
+    git(c, "remote", "set-head", "origin", "master");
+    g = fakeGh(join(root, "gh-i"));
+    tree("s/super"); // superseded: no PR, its one commit on no remote
+    tree("s/dirty");
+    git(folder("s/dirty"), "push", "-q", "-u", "origin", "s/dirty");
+    writeFileSync(join(folder("s/dirty"), "a.txt"), "uncommitted\n");
+    tree("s/locked");
+    git(c, "worktree", "lock", folder("s/locked"));
+    git(c, "branch", "s/plain", "origin/master");
+    tree("s/merged-a");
+    g.merged("s/merged-a", git(folder("s/merged-a"), "rev-parse", "HEAD"), 1, "2026-10-01T00:00:00Z");
+    tree("s/merged-b");
+    g.merged("s/merged-b", git(folder("s/merged-b"), "rev-parse", "HEAD"), 2, "2026-10-02T00:00:00Z");
+    tree("s/gone-folder"); // last: the next add's `git worktree prune` would forget it
+    rmSync(folder("s/gone-folder"), { recursive: true });
+  });
+
+  test("parsePicks reads numbers and ranges, and refuses the rest", () => {
+    expect(parsePicks("3 1,5-6  1", 6)).toEqual([1, 3, 5, 6]);
+    expect(parsePicks("  ", 6)).toEqual([]);
+    for (const bad of ["x", "0", "7", "5-3", "1-7", "-1"]) expect(() => parsePicks(bad, 6)).toThrow();
+  });
+
+  test("offers everything but what git or the default holds, with what each would lose", () => {
+    const r = pick("");
+    expect(r.code).toBe(0);
+    expect(offeredLine(r.out, "s/super")).toContain("[loses: 1 commit on no remote branch]");
+    expect(offeredLine(r.out, "s/dirty")).toContain("[loses: 1 uncommitted file]");
+    expect(offeredLine(r.out, "s/merged-a")).toContain("worktree s-merged-a/ goes too");
+    expect(offeredLine(r.out, "s/merged-a")).not.toContain("loses");
+    expect(offeredLine(r.out, "s/merged-b")).toContain("stays for add to reuse");
+    expect(offeredLine(r.out, "s/plain")).not.toBe("");
+    for (const b of ["master", "s/locked", "s/gone-folder"]) expect(num(r.out, b)).toBeUndefined();
+    expect(r.out).toMatch(/^ {2}s\/locked +[0-9a-f]+ {2}checked out in s-locked\/, locked$/m);
+    expect(r.out).toMatch(/s\/gone-folder.*folder missing/);
+    expect(r.out).not.toContain("nothing changed");
+  });
+
+  test("end of input, Enter and anything but yes delete nothing; a bad pick asks again", () => {
+    const line = pick("").out;
+    const n = num(line, "s/super")!;
+    expect(pick("\n").code).toBe(0);
+    const no = pick(`${n}\nno\n`);
+    expect(no.out).toContain("about to delete");
+    expect(no.out).toContain("nothing picked was deleted");
+    const bad = pick(`99\nabc\n${n}\n`);
+    expect(bad.out).toContain("99 is not within");
+    expect(bad.out).toContain('"abc" is not a number or a range');
+    expect(bad.out).toContain("nothing picked was deleted");
+    expect(existsSync(folder("s/super"))).toBe(true);
+    expect(has("s/super")).toBe(true);
+  });
+
+  test("a picked worktree goes even dirty and unmerged, and only what was picked goes", () => {
+    const out = pick("").out;
+    const sha = git(c, "rev-parse", "--short", "s/super");
+    const r = pick(`${num(out, "s/super")} ${num(out, "s/dirty")} ${num(out, "s/plain")}\nyes\n`);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("removed worktree s-super/");
+    expect(r.out).toContain(`deleted s/super (was ${sha}`);
+    for (const b of ["s/super", "s/dirty", "s/plain"]) expect(has(b)).toBe(false);
+    for (const b of ["s/super", "s/dirty"]) expect(existsSync(folder(b))).toBe(false);
+    for (const b of ["s/locked", "s/gone-folder", "s/merged-a", "s/merged-b", "master"]) expect(has(b)).toBe(true);
+    expect(existsSync(folder("s/merged-a"))).toBe(true);
+  });
+
+  test("a worktree that changed after it was offered stays", async () => {
+    tree("s/race");
+    const proc = Bun.spawn(["bun", TOOL, "prune", "-i"], { cwd: c, env: { ...env, ...g.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    let out = "";
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    while (!out.includes("Numbers to delete")) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`prune ended before asking:\n${out}`);
+      out += decoder.decode(value);
+    }
+    writeFileSync(join(folder("s/race"), "late.txt"), "written after the list\n");
+    proc.stdin.write(`${num(out, "s/race")}\nyes\n`);
+    await proc.stdin.end();
+    expect(await proc.exited).not.toBe(0);
+    expect(await new Response(proc.stderr).text()).toContain("changed since you picked it (now: 1 commit on no remote branch, 1 uncommitted file)");
+    expect(readFileSync(join(folder("s/race"), "late.txt"), "utf8")).toContain("after the list");
+    expect(has("s/race")).toBe(true);
+    git(c, "worktree", "remove", "--force", folder("s/race"));
+    git(c, "branch", "-D", "s/race");
+  });
+
+  test("removing the worktree it runs in says where to go", () => {
+    tree("s/here");
+    const out = pick("", ["-i"], folder("s/here")).out;
+    expect(offeredLine(out, "s/here")).toContain("has a process running in it");
+    const r = pick(`${num(out, "s/here")}\nyes\n`, ["-i"], folder("s/here"));
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`your shell's directory is gone; run: cd ${JSON.stringify(realpathSync(c))}`);
+    expect(existsSync(folder("s/here"))).toBe(false);
+    expect(has("s/here")).toBe(false);
+  });
+
+  test("with --yes the merged ones go first, and the spare can still be picked", () => {
+    const r = pick("", ["--yes", "-i"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("removed worktree s-merged-a/");
+    expect(has("s/merged-a")).toBe(false);
+    expect(num(r.out, "s/merged-a")).toBeUndefined();
+    expect(has("s/merged-b")).toBe(true);
+    const n = num(r.out, "s/merged-b")!;
+    const again = pick(`${n}\nyes\n`, ["--yes", "-i"]);
+    expect(again.out).toContain("removed worktree s-merged-b/");
+    expect(has("s/merged-b")).toBe(false);
   });
 });
 
