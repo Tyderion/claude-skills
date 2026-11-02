@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1157,7 +1157,7 @@ describe("prune", () => {
     expect(kept("p/local")).toBe("no upstream, no merged PR");
     expect(kept("p/open")).toBe("tracking origin/p/open, no merged PR");
     expect(kept("p/past")).toBe("tracking origin/p/past, t/prune#4 merged, but 1 commit came after it");
-    expect(kept("p/inwt")).toBe("checked out in p-inwt/");
+    expect(kept("p/inwt")).toBe("merged in t/prune#5, p-inwt/ stays for add to reuse");
     expect(kept("p/vanished")).toMatch(/^checked out in \/.*prune-vanished\/ \(folder missing\)$/);
     expect(kept("p/rb")).toMatch(/^rebasing in \/.*prune-rb\/$/);
     expect(kept("master")).toBe("default branch");
@@ -1170,7 +1170,7 @@ describe("prune", () => {
     for (const b of all) expect(has(b)).toBe(true);
     expect(existsSync(join(c, "stray-empty"))).toBe(true);
     expect(git(c, "worktree", "list")).toContain("prune-vanished");
-    for (const b of ["master", "p/inwt", "p/vanished", "p/rb"]) expect(g.calls()).not.toContain(`--head ${b} `);
+    for (const b of ["master", "p/vanished", "p/rb"]) expect(g.calls()).not.toContain(`--head ${b} `);
   });
 
   test("--yes deletes the merged branches and empty folders only, printing each SHA", () => {
@@ -1231,6 +1231,153 @@ describe("prune", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("master is still a local branch; nothing was deleted");
     expect(has("master")).toBe(true);
+  });
+});
+
+describe("prune removes merged worktrees", () => {
+  let c: string;
+  let g: FakeGh;
+  const wtGh = (...a: string[]) => sh("bun", [TOOL, ...a], c, g.env);
+  const folder = (b: string) => join(c, b.replace(/\//g, "-"));
+  const has = (b: string) => sh("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${b}`], c).code === 0;
+  let pr = 100;
+  /** A worktree on its own branch with one commit, merged on GitHub at `day` unless that is left out. */
+  function tree(b: string, day?: string) {
+    expect(wtGh("add", b, "--fresh").code).toBe(0);
+    writeFileSync(join(folder(b), `${b.replace(/\//g, "-")}.txt`), "w\n");
+    git(folder(b), "add", "."); git(folder(b), "commit", "-qm", b);
+    if (day) g.merged(b, git(folder(b), "rev-parse", "HEAD"), pr++, `2026-10-${day}T00:00:00Z`);
+  }
+  const row = (out: string, b: string) => out.split("\n").find((l) => l.startsWith(`  ${b} `)) ?? "";
+
+  beforeAll(() => {
+    const bare = makeRemote("prune-wt-r");
+    c = join(root, "prunewt");
+    expect(wt(root, "clone", bare, "--dir", c).code).toBe(0);
+    const url = "https://github.com/t/prunewt.git";
+    git(c, "config", `url.${bare}.insteadOf`, url);
+    git(c, "remote", "set-url", "origin", url);
+    git(c, "remote", "set-head", "origin", "master");
+    g = fakeGh(join(root, "gh-wt"));
+    writeFileSync(join(c, "shared.env"), "s=1\n");
+    writeFileSync(join(c, ".shared"), "shared.env\n");
+    expect(wt(c, "sync").code).toBe(0);
+
+    tree("w/old", "01");
+    tree("w/older", "02");
+    tree("w/spare", "10");
+    tree("w/dirty", "20"); // the newest merge, but dirty, so it can't be the spare
+    writeFileSync(join(folder("w/dirty"), "a.txt"), "uncommitted\n");
+    tree("w/untracked", "21");
+    writeFileSync(join(folder("w/untracked"), "notes.txt"), "mine\n");
+    tree("w/open"); // no PR
+    tree("w/after", "03");
+    writeFileSync(join(folder("w/after"), "more.txt"), "after merge\n");
+    git(folder("w/after"), "add", "."); git(folder("w/after"), "commit", "-qm", "after merge");
+    tree("w/locked", "22");
+    git(c, "worktree", "lock", folder("w/locked"));
+    mkdirSync(join(folder("w/old"), "build"));
+    writeFileSync(join(folder("w/old"), "build", "out.bin"), "ignored\n");
+    g.merged("master", git(c, "rev-parse", "master"), 99, "2026-10-30T00:00:00Z");
+  });
+
+  test("the preview names what goes and why the rest stays, and changes nothing", () => {
+    const r = wtGh("prune");
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/deleted by --yes \(2\):/);
+    expect(row(r.out, "w/old")).toContain("worktree w-old/ goes too");
+    expect(row(r.out, "w/older")).toContain("worktree w-older/ goes too");
+    expect(row(r.out, "w/spare")).toContain("w-spare/ stays for add to reuse");
+    expect(row(r.out, "w/dirty")).toContain("but w-dirty/ has uncommitted changes or untracked files");
+    expect(row(r.out, "w/untracked")).toContain("but w-untracked/ has uncommitted changes or untracked files");
+    expect(row(r.out, "w/locked")).toContain("but w-locked/ is locked");
+    expect(row(r.out, "w/open")).toContain("checked out in w-open/");
+    expect(row(r.out, "w/after")).toContain("checked out in w-after/");
+    expect(row(r.out, "master")).toContain("default branch");
+    expect(existsSync(folder("w/old"))).toBe(true);
+    expect(has("w/old")).toBe(true);
+  });
+
+  test("a running process keeps its worktree, and the spare is picked from the others", () => {
+    const proc = spawn("sleep", ["60"], { cwd: folder("w/spare"), stdio: "ignore" });
+    try {
+      const r = wtGh("prune");
+      expect(row(r.out, "w/spare")).toContain("but w-spare/ has a process running in it");
+      expect(row(r.out, "w/older")).toContain("w-older/ stays for add to reuse");
+      expect(row(r.out, "w/old")).toContain("worktree w-old/ goes too");
+    } finally {
+      proc.kill();
+    }
+    // The kill is asynchronous; lsof must stop seeing it before the next test counts on that.
+    while (sh("sh", ["-c", `lsof -nP -d cwd -Fn | grep -qxF "n${realpathSync(folder("w/spare"))}"`], c).code === 0) Bun.sleepSync(20);
+  });
+
+  test("its own version of a shared path keeps a worktree", () => {
+    tree("w/copy", "04");
+    tree("w/reallink", "05");
+    const shared = readFileSync(join(c, ".shared"), "utf8");
+    writeFileSync(join(c, "app.yaml"), "default\n");
+    writeFileSync(join(folder("w/copy"), "app.yaml"), "edited\n");
+    rmSync(join(folder("w/reallink"), "shared.env"));
+    writeFileSync(join(folder("w/reallink"), "shared.env"), "mine\n");
+    writeFileSync(join(c, ".shared"), `${shared}[copy]\napp.yaml\n`);
+    try {
+      const r = wtGh("prune");
+      expect(row(r.out, "w/copy")).toContain("but w-copy/ has its own version of app.yaml");
+      expect(row(r.out, "w/reallink")).toContain("but w-reallink/ has its own shared.env where a shared link belongs");
+    } finally {
+      writeFileSync(join(c, ".shared"), shared);
+      rmSync(join(c, "app.yaml"));
+      for (const [wtName, b] of [["w-copy", "w/copy"], ["w-reallink", "w/reallink"]]) {
+        git(c, "worktree", "remove", "--force", join(c, wtName));
+        git(c, "branch", "-D", b);
+      }
+    }
+  });
+
+  test("when gh fails no worktree goes", () => {
+    const r = sh("bun", [TOOL, "prune", "--yes"], c, { GIT_WT_GH: join(root, "no-such-gh") });
+    expect(r.code).toBe(0);
+    expect(existsSync(folder("w/old"))).toBe(true);
+    expect(has("w/old")).toBe(true);
+  });
+
+  test("--gone never removes a worktree", () => {
+    tree("w/gone");
+    git(folder("w/gone"), "push", "-q", "-u", "origin", "w/gone");
+    git(folder("w/gone"), "push", "-q", "origin", "--delete", "w/gone");
+    expect(wtGh("prune", "--yes", "--gone").code).toBe(0);
+    expect(existsSync(folder("w/gone"))).toBe(true);
+    expect(has("w/gone")).toBe(true);
+    // That run was also a plain --yes: the next test sees what it left.
+  });
+
+  test("--yes removes the worktree and its branch, ignored files included; shared files survive", () => {
+    expect(existsSync(folder("w/old"))).toBe(false);
+    expect(has("w/old")).toBe(false);
+    expect(existsSync(folder("w/older"))).toBe(false);
+    expect(has("w/older")).toBe(false);
+    expect(readFileSync(join(c, "shared.env"), "utf8")).toBe("s=1\n");
+    for (const b of ["w/spare", "w/dirty", "w/untracked", "w/locked", "w/open", "w/after"]) {
+      expect(existsSync(folder(b))).toBe(true);
+      expect(has(b)).toBe(true);
+    }
+    expect(readFileSync(join(folder("w/dirty"), "a.txt"), "utf8")).toBe("uncommitted\n");
+    expect(readFileSync(join(folder("w/untracked"), "notes.txt"), "utf8")).toBe("mine\n");
+    expect(existsSync(join(c, "master"))).toBe(true);
+    expect(has("master")).toBe(true);
+  });
+
+  test("a second run leaves the spare, and add then reuses it", () => {
+    const again = wtGh("prune", "--yes");
+    expect(again.code).toBe(0);
+    expect(again.out).not.toContain("removed worktree");
+    expect(existsSync(folder("w/spare"))).toBe(true);
+    const r = wtGh("add", "w/next");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("reusing w-spare/");
+    expect(existsSync(folder("w/next"))).toBe(true);
+    expect(existsSync(folder("w/spare"))).toBe(false);
   });
 });
 

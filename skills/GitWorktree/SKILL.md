@@ -1,7 +1,7 @@
 ---
 name: {{SKILL_NAME}}
 version: 1.0.0
-description: Bare-repo worktree containers via the git-wt CLI and the wtc shell function: clone into <container>/.bare + one folder per branch, convert a checkout in place, add a worktree per branch, reuse a merged worktree for a new branch (keeps node_modules), share files like .env across worktrees, and prune merged local branches (squash merges included). USE WHEN clone a repo, clone into coding, set up a repo, bare repo, .bare, git worktree, new worktree, work on two branches at once, reuse or recycle a worktree, avoid reinstalling dependencies, convert repo to worktrees, share .env across worktrees, prune branches, delete merged branches, clean up old branches, git-wt, wtc, start Claude in a worktree. NOT FOR removing worktrees or general git history work.
+description: Bare-repo worktree containers via the git-wt CLI and the wtc shell function: clone into <container>/.bare + one folder per branch, convert a checkout in place, add a worktree per branch, reuse a merged worktree for a new branch (keeps node_modules), share files like .env across worktrees, and prune merged local branches and their worktrees (squash merges included). USE WHEN clone a repo, clone into coding, set up a repo, bare repo, .bare, git worktree, new worktree, work on two branches at once, reuse or recycle a worktree, avoid reinstalling dependencies, convert repo to worktrees, share .env across worktrees, prune branches, delete merged branches, clean up old branches, clean up merged worktrees, git-wt, wtc, start Claude in a worktree. NOT FOR removing a worktree that is not merged, or general git history work.
 ---
 
 # {{SKILL_NAME}}
@@ -26,13 +26,14 @@ Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/{{SKILL_NAME}}/PREFERENCES.md`
 | Share one file across worktrees (edits visible everywhere) | move it to the container root, list it under `[link]` in `<container>/.shared`, then `git-wt sync` |
 | Give each worktree its own editable copy of a default | put the default in the container root, list it under `[copy]`, then `git-wt sync` |
 | Throw away a worktree's edits to a copied file | `git-wt sync --reset <path>` (replaces every diverged copy with the root default) |
-| Clean up dead local branches | `git-wt prune` first and show the principal the list; only then `git-wt prune --yes`. Add `--gone` only when the principal asks to drop upstream-gone branches that have no merged PR |
+| Clean up dead local branches and merged worktrees | `git-wt prune` first and show the principal the list; only then `git-wt prune --yes`. Add `--gone` only when the principal asks to drop upstream-gone branches that have no merged PR |
 
 ## Gotchas
 
 - **Reuse refuses**, before anything changes, on tracked changes, untracked-but-not-ignored files, populated submodules, a worktree outside the container, or a target branch tracking a path that sits untracked in the worktree (an ignored file, a `[copy]` file, a shared link). From `add`, a refusal falls back to a fresh worktree.
 - **Auto-reuse counts a worktree as merged only when a merged PR's head commit is its HEAD or descends from it.** Commits made after the merge disqualify it, and so does being the default branch's worktree. It asks `gh` about every github.com remote, so a fork's origin only finds PRs opened against the fork.
 - **`prune` deletes by the merged-PR rule, never `git branch --merged`** (squash merges defeat it). `--gone` also deletes upstream-gone branches, which may hold commits never pushed; branches with no upstream go only with a merged PR. Leftover non-empty folders are listed, not removed; they usually hold files a tool wrote after the worktree was removed.
+- **`prune --yes` removes merged worktrees, ignored files included, and keeps one for reuse.** node_modules, `.idea` and any ignored file you wrote by hand go with the folder, so read the preview. The default branch's worktree never goes, and neither does the most recently merged worktree that could go, which `add` reuses next. A merged worktree also stays while it has tracked changes, untracked files, its own version of a `[copy]` or `[link]` path, a lock, or a process running in it; a commit made after the merge means it isn't merged at all. It never uses `--force`. Worktrees with no merged PR stay, `--gone` included.
 - **Reuse starts new branches from the remote's default**; plain `add` starts from the local default, which is stale after a merge.
 - **Sync aborts, nothing changed, on a real file where a link belongs.** Report the conflict and ask the principal which copy wins.
 - **`[copy]` files are overwritten only by `--reset`**, which skips copies identical to the root. Removing an entry from `[copy]` leaves the files and keeps them git-excluded until no worktree has one. To commit a copied file, find it under `# copy` in the managed block of `.bare/info/exclude` and `git add -f` it.

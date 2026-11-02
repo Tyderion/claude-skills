@@ -57,14 +57,18 @@ const USAGE = `git-wt — bare-repo worktree containers
       conflict aborts the whole sync with nothing changed.
 
   git-wt prune [--yes] [--gone] [-C <container>]
-      Find dead local branches: fetch --prune, then ask gh which branches have a
-      merged PR containing their tip, which works for squash merges. Lists every
-      local branch with the reason it would be deleted or kept, and folders in the
-      container that aren't worktrees. Deletes nothing without
-      --yes, which deletes the merged branches (printing each SHA) and empty
-      folders. --gone also deletes the upstream-gone ones. Never touched: the
-      default branch (.bare/HEAD and every remote's HEAD) and branches a worktree
-      has checked out, is rebasing or is bisecting, even if its folder is missing.
+      Find dead local branches and worktrees: fetch --prune, then ask gh which
+      branches have a merged PR containing their tip, which works for squash merges.
+      Lists every local branch with the reason it would be deleted or kept, and
+      folders in the container that aren't worktrees. Deletes nothing without --yes,
+      which deletes the merged branches (printing each SHA), their worktrees, and
+      empty folders. --gone also deletes upstream-gone branches, never a worktree.
+      The most recently merged removable worktree stays for add to reuse. A merged
+      worktree also stays while it has anything removal would lose but ignored files
+      (changes, untracked files, its own version of a shared file), is locked, or has
+      a process running in it. Never touched: the default branch (.bare/HEAD and every
+      remote's HEAD) and its worktree, and branches a worktree is rebasing or bisecting,
+      or has checked out with its folder missing.
 
   git-wt open <branch> [--from <start> | --remote <name>] [--fresh] [-C <container>]
       Get <branch>'s worktree ready and print its path, alone, on stdout (the rest
@@ -686,6 +690,26 @@ function dropReused(container: string, branch: string, tip: string) {
   log(`deleted ${branch} (was ${git(container, "rev-parse", "--short", tip)}; merged in ${prRef(proof)})`);
 }
 
+/** Why removing a worktree could hurt, or undefined when it can go. On top of what stops a reuse:
+ *  a reuse keeps the folder and its shared paths, so it never had to ask about those. */
+function notRemovable(container: string, wt: Worktree): string | undefined {
+  const why = notReusable(container, wt);
+  if (why) return why.split("\n")[0].replace(/:$/, "");
+  const { link, copy } = readShared(container);
+  for (const p of link) {
+    const st = lstatOrNull(join(wt.path, p));
+    if (st && !st.isSymbolicLink()) return `has its own ${p} where a shared link belongs`;
+  }
+  for (const p of copy) {
+    if (lstatOrNull(join(wt.path, p)) && !run("diff", ["-rq", "--no-dereference", join(container, p), join(wt.path, p)], undefined, true).ok) return `has its own version of ${p}`;
+  }
+  // lsof exits 1 when it merely couldn't read some processes, so only a failed spawn means no answer.
+  const lsof = spawnSync("lsof", ["-nP", "-d", "cwd", "-Fn"], { encoding: "utf8", maxBuffer: 1 << 28 });
+  if (lsof.error) return `may have a process running in it (cannot run lsof: ${lsof.error.message})`;
+  const inIt = (dir: string) => dir === wt.path || dir.startsWith(wt.path + sep);
+  if (lsof.stdout.split("\n").some((l) => l.startsWith("n") && inIt(l.slice(1)))) return "has a process running in it";
+}
+
 const prRef = (p: Proof) => `${p.repo}#${p.pr}${p.base ? ` into ${p.base}` : ""}`;
 
 /** Branches never deleted, with why: the default per .bare/HEAD, plus each remote's HEAD, which stays
@@ -765,7 +789,9 @@ export async function prune(container: string, { yes = false, gone = false } = {
       const [ref, tip, short, upstream, track] = line.split("\0");
       return { name: ref.replace(/^refs\/heads\//, ""), tip, short, upstream, gone: track === "[gone]" };
     });
-  const candidates = branches.filter((b) => !defaults.has(b.name) && !busy.has(b.name));
+  // Branches a worktree simply has checked out are candidates too; a folder that's missing or mid-rebase isn't one.
+  const held = new Map(worktrees(container).filter((w) => w.branch && busy.has(w.branch) && !defaults.has(w.branch)).map((w) => [w.branch!, w]));
+  const candidates = branches.filter((b) => !defaults.has(b.name) && (!busy.has(b.name) || held.has(b.name)));
 
   const remotes = githubRemotes(container);
   if (!remotes.length) log("no GitHub remote, so no branch can be shown merged; --gone deletes branches whose upstream is gone");
@@ -776,14 +802,34 @@ export async function prune(container: string, { yes = false, gone = false } = {
   const errors = [...verdicts.values()].flatMap((v) => v.error ?? []);
   if (errors.length) log(`warning: ${errors[0]}${errors.length > 1 ? `, and ${errors.length - 1} more like it` : ""}; those branches count as not merged`);
 
+  // Merged worktrees: those that must stay, and the most recently merged of the rest, which stays for
+  // add to reuse. It is picked from worktrees reuse would accept, so a dirty one can't take its place.
+  const blocked = new Map<string, string>();
+  let spare: { branch: string; mergedAt: string } | undefined;
+  for (const [branch, wt] of held) {
+    const proof = verdicts.get(branch)?.proof;
+    if (!proof) continue;
+    const why = notRemovable(container, wt);
+    if (why) blocked.set(branch, why);
+    else if (!spare || proof.mergedAt > spare.mergedAt) spare = { branch, mergedAt: proof.mergedAt };
+  }
+
   // Every branch lands in exactly one list, with the reason that put it there.
   const merged: [Branch, string][] = [];
   const goneOnly: [Branch, string][] = [];
   const kept: [Branch, string][] = [];
   for (const b of branches) {
     const v = verdicts.get(b.name);
+    const wt = held.get(b.name);
     if (!v) kept.push([b, defaults.get(b.name) ?? busy.get(b.name)!]);
-    else if (v.proof) merged.push([b, `merged in ${prRef(v.proof)}`]);
+    else if (wt && !v.proof) kept.push([b, busy.get(b.name)!]);
+    else if (wt) {
+      const folder = `${basename(wt.path)}/`;
+      const pr = `merged in ${prRef(v.proof!)}`;
+      if (blocked.has(b.name)) kept.push([b, `${pr}, but ${folder} ${blocked.get(b.name)}`]);
+      else if (spare?.branch === b.name) kept.push([b, `${pr}, ${folder} stays for add to reuse`]);
+      else merged.push([b, `${pr}, worktree ${folder} goes too`]);
+    } else if (v.proof) merged.push([b, `merged in ${prRef(v.proof)}`]);
     else {
       const n = v.nearest;
       const unmerged = v.error ? "GitHub not asked (see warning)"
@@ -799,6 +845,18 @@ export async function prune(container: string, { yes = false, gone = false } = {
     // The gh calls took a while; a branch that moved since is not the one that was checked.
     if (gitTry(container, "rev-parse", "--verify", "--quiet", `refs/heads/${b.name}`).out !== b.tip) {
       return void failed.push(`${b.name}: moved since prune read it at ${b.short}; left alone`);
+    }
+    const wt = held.get(b.name);
+    if (wt) {
+      const folder = `${basename(wt.path)}/`;
+      const now = worktrees(container).find((w) => w.path === wt.path);
+      if (now?.branch !== b.name) return void failed.push(`${folder}: no longer on ${b.name}; left alone`);
+      const why = notRemovable(container, wt);
+      if (why) return void failed.push(`${folder}: ${why} since prune read it; left alone`);
+      // Never --force: git's own refusal is the last check that nothing but ignored files goes.
+      const removed = gitTry(container, "worktree", "remove", wt.path);
+      if (!removed.ok) return void failed.push(`${folder}: ${removed.err.trim()}`);
+      log(`removed worktree ${folder}`);
     }
     const r = gitTry(container, "branch", "-D", b.name);
     if (r.ok) log(`deleted ${b.name} (was ${b.short}; ${why})`);
