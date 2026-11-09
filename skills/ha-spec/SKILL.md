@@ -7,13 +7,11 @@ description: Write a behavioral spec for a Home Assistant change, from one autom
 
 ## Customization
 
-Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/{{SKILL_NAME}}/PREFERENCES.md` if present. It names where specs go on this machine and how that location is reached, which answers *Where to write the file*.
+Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/{{SKILL_NAME}}/PREFERENCES.md` if present; it is used in *Where to write the file*.
 
 ## What you are doing
 
-You are **designing, not implementing.** You produce one Markdown spec file. A different Claude Code session — running on the Home Assistant machine itself, with live access to entity states, service schemas, traces, and history — reads that file and builds the thing.
-
-You have no access to that instance. Act like it.
+You produce one Markdown spec file. A separate Claude Code session on the Home Assistant machine, with live access to entities, services, traces and history, implements it; you have no access to that instance.
 
 ## The hard rule: behavioral only
 
@@ -28,13 +26,9 @@ Do **not** put any of these in a spec:
 - Dashboard card JSON, card `type` names, or custom-card names
 - Area slugs, device IDs, zone names, segment/room IDs
 
-Real systems are full of names nobody could guess: an air conditioner whose entity ID is a long string of digits; a light group called "Apartment" that covers only two rooms; a vacuum room labelled "Hallway" whose helper is named after an abbreviation; a seasonal switch that is `unavailable` most of the year. A spec that guessed at any of these would be wrong every time.
-
 **Instead, name things the way the user says them,** and add enough detail to disambiguate:
 
 > "the ceiling light in the office" · "the robot vacuum" · "the flag that tracks whether someone is asleep" · "the outdoor temperature sensor" · "the living-room blinds (there are three)"
-
-The implementer resolves those to real entities with its discovery tools.
 
 If the user volunteers an exact entity ID, record it in **Naming hints** (below) marked as user-supplied and unverified — never inline it into the behavior as fact.
 
@@ -50,7 +44,7 @@ Before writing, decide which you have:
 
 **System** — state that outlives a single run, two or more automations, or two user actions touching the same state. Tells: "queue", "mode", "remember", "next", "in order", "until", "resume". Use the *System* template.
 
-When in doubt, use the System template — its extra sections collapse to nothing if unused, whereas cramming a system into the single-change template silently loses the invariants, which is where the bugs live.
+When in doubt, use the System template; its extra sections collapse to nothing if unused.
 
 ## Interview before writing
 
@@ -107,13 +101,13 @@ Checklist the implementer can verify against a live system. Each item must be ob
 - [ ] ...
 
 ## Naming hints
-Devices, rooms, and flags named the way the user refers to them, with any disambiguating detail. This is what the implementer resolves against. Mark anything user-supplied but unverified.
+Devices, rooms, and flags named the way the user refers to them, with any disambiguating detail. This is what the implementer resolves against.
 
 ## Out of scope
 What this deliberately does not do.
 
 ## Open questions
-Anything you could not resolve. Empty is good — if this has entries, say so when you hand the file over.
+Anything you could not resolve. Empty is good.
 ```
 
 ## Spec file format — system
@@ -167,27 +161,18 @@ Grouped by flow, plus a group for the invariants. Every item observable.
 
 ## Worked example of the shape
 
-A room-queue system for a robot vacuum — the kind of feature that fails badly in the single-change template — decomposes like this. Note there is not one trigger but five, and that the invariants belong to no single flow:
+A room-queue system for a robot vacuum decomposes like this. Note there is not one trigger but five, and that the invariants belong to no single flow:
 
 - **State:** an ordered list of rooms waiting to be cleaned, surviving restart, empty when idle; plus a marker for the room being cleaned right now, blank when idle.
 - **Flows:** add a room · start cleaning when the vacuum is docked and the list is non-empty · advance to the next room on completion · clear the list · start automatically when everyone leaves.
 - **Invariants:** a room is never queued twice · the room being cleaned is not also in the waiting list · the active marker is blank whenever nothing is being cleaned · only one room is cleaned at a time.
 - **Surfaces:** a readable list of what's queued and in what order; what's cleaning now; a way to add a room; a way to clear everything.
 
-Written that way, the implementer can choose storage, decide how many automations it takes, and verify each invariant independently. Written as one flat automation, all of that is lost.
-
-## Acceptance criteria: good vs useless
-
-Good:
+## Good acceptance criteria
 
 - [ ] Pressing the bathroom button twice within 2s leaves the light at full brightness
 - [ ] The automation does not run between 23:00 and 06:00 while sleep mode is on
 - [ ] If a light is unavailable, the remaining lights still turn off
-
-Useless:
-
-- [ ] The automation works correctly
-- [ ] Lights behave as expected
 
 ## Where to write the file
 

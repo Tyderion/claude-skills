@@ -18,57 +18,29 @@ Load `~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/{{SKILL_NAME}}/PREFERENCES.md`
 |--------|---------|
 | Clone a URL into the layout | `git-wt clone <url> [--dir <path>] [--base <dir>] [--name <name>]` |
 | Convert an existing normal checkout | `git-wt convert [<path>]` |
-| New worktree for a branch | `git-wt add <branch> [--from <start> \| --remote <name>] [-C <container>]`: tracks the branch from whichever remote has it; `--remote` picks when several do. On a GitHub remote it reuses a clean worktree whose PR was merged, if there is one |
+| New worktree for a branch | `git-wt add <branch> [--from <start> \| --remote <name>] [-C <container>]`; reuses a merged worktree when one exists |
 | New worktree, and never reuse | `git-wt add <branch> --fresh` |
-| Start working on a branch: worktree ready (pulled, deps installed, MCP approvals copied), then Claude in it | `wtc <branch>`, a shell function from `{{SKILL_DIR}}/Tools/wtc.sh` around `git-wt open <branch>`. It has to run in the principal's own shell, because Claude only loads a repo's `.mcp.json`, hooks and settings from the folder it starts in. So hand over the exact command; don't run it from this session |
-| Reuse a specific worktree for another branch | `git-wt reuse <worktree> <branch> [--from <start> \| --remote <name>]`: `<worktree>` is a folder, path or branch name |
+| Start working on a branch: worktree ready (pulled, deps installed, MCP approvals copied), then Claude in it | `wtc <branch>`, a shell function from `{{SKILL_DIR}}/Tools/wtc.sh` around `git-wt open <branch>`. It runs in the principal's own shell (Claude loads a repo's `.mcp.json`, hooks and settings only from the folder it starts in), so hand over the exact command instead of running it here |
+| Reuse a specific worktree for another branch | `git-wt reuse <worktree> <branch> [--from <start> \| --remote <name>]` |
 | Reuse a worktree, without naming which | Don't pick one. List the container's worktrees (`git worktree list`, leaving out the default branch's) and ask the principal which to reuse, then run `git-wt reuse` |
 | Share one file across worktrees (edits visible everywhere) | move it to the container root, list it under `[link]` in `<container>/.shared`, then `git-wt sync` |
 | Give each worktree its own editable copy of a default | put the default in the container root, list it under `[copy]`, then `git-wt sync` |
 | Throw away a worktree's edits to a copied file | `git-wt sync --reset <path>` (replaces every diverged copy with the root default) |
-| Clean up dead local branches | `git-wt prune` first (every local branch, grouped by fate, with the reason on its line) and show the principal the list; only then `git-wt prune --yes`. Add `--gone` only when the principal asks to drop upstream-gone branches that have no merged PR |
-
-Base directory for `clone` defaults to `$GIT_WT_BASE`, else `~/coding`. Worktree folders are the branch name with `/` → `-` (`feature/x` → `feature-x/`).
-
-## Examples
-
-```
-User: "clone git@github.com:org/tool.git"
-→ git-wt clone git@github.com:org/tool.git
-→ ~/coding/tool/{.bare, .git, .shared, main/}
-```
-
-```
-User: "I want to work on feature/login in parallel"
-→ git-wt add feature/login -C ~/coding/tool   → ~/coding/tool/feature-login/
-```
-
-```
-User: "both worktrees should use the same .env"
-→ one real .env at ~/coding/tool/.env (if a worktree holds the only copy, move it there first)
-→ append ".env" to ~/coding/tool/.shared → git-wt sync
-```
-
-```
-User: "start on feature/y" (feature-x/'s PR is merged on GitHub)
-→ git-wt add feature/y   → reuses feature-x/ as ~/coding/tool/feature-y/, node_modules intact
-```
+| Clean up dead local branches | `git-wt prune` first and show the principal the list; only then `git-wt prune --yes`. Add `--gone` only when the principal asks to drop upstream-gone branches that have no merged PR |
 
 ## Gotchas
 
-- **Reuse keeps ignored files only, and never lets git overwrite one.** Tracked changes, untracked-but-not-ignored files, populated submodules, or a worktree outside the container folder make `reuse` refuse. So does a target branch that tracks a path sitting untracked in the worktree (an ignored file, a `[copy]` file, a shared link), which a plain checkout would silently replace. All refusals happen before anything changes; from `add`, a refusal falls back to a fresh worktree. After a reuse, the old local branch is deleted only when a merged PR contains it (the auto-reuse rule below), with its SHA printed; otherwise it stays.
-- **Auto-reuse counts a worktree as merged only when a merged PR's head commit is its HEAD or descends from it.** Commits made after the merge disqualify it, and so does being the default branch's worktree. It asks `gh` about every github.com remote, so a fork's origin only finds PRs opened against the fork. A PR head that isn't local (a review suggestion applied on GitHub) is fetched from `refs/pull/<n>/head`. When `gh` is missing or fails, `add` says so and creates a fresh worktree.
-- **`prune` deletes by the same merged-PR rule, never by `git branch --merged`**, which squash merges defeat. Upstream gone (`[gone]`) only means the remote branch was deleted, possibly unmerged, so those branches are listed and deleted only with `--gone`, which can lose commits that were never pushed. Branches with no upstream are deleted only when a merged PR proves them, never by `--gone`. The default branch and branches a worktree holds (the reuse pool, plus any mid-rebase or mid-bisect) are never deleted. Folders in the container that aren't worktrees are removed by `--yes` only when they hold no files; a removed worktree's folder often keeps files a running tool wrote after removal, so those are listed for the principal.
-- **Reuse fetches every remote and starts new branches from the remote's default branch**, unlike plain `add`, which starts from the local default. After a merge the local default is stale. A failed fetch is a warning; reuse carries on with local refs.
-
-- **Sync never overwrites a real file.** A real file where a shared link belongs aborts the whole sync with nothing changed. Resolving it (which copy wins, where it moves) is the principal's call; report the conflict and ask.
-- **`[copy]` files are copied once, then belong to the worktree.** Sync never overwrites an existing copy; only `--reset` does, and it skips copies identical to the root. Removing an entry from `[copy]` leaves the files and keeps them git-excluded until no worktree has one. To commit a copied file, find it under `# copy` in the managed block of `.bare/info/exclude` and `git add -f` it.
+- **Reuse refuses**, before anything changes, on tracked changes, untracked-but-not-ignored files, populated submodules, a worktree outside the container, or a target branch tracking a path that sits untracked in the worktree (an ignored file, a `[copy]` file, a shared link). From `add`, a refusal falls back to a fresh worktree.
+- **Auto-reuse counts a worktree as merged only when a merged PR's head commit is its HEAD or descends from it.** Commits made after the merge disqualify it, and so does being the default branch's worktree. It asks `gh` about every github.com remote, so a fork's origin only finds PRs opened against the fork.
+- **`prune` deletes by the merged-PR rule, never `git branch --merged`** (squash merges defeat it). `--gone` also deletes upstream-gone branches, which may hold commits never pushed; branches with no upstream go only with a merged PR. Leftover non-empty folders are listed, not removed; they usually hold files a tool wrote after the worktree was removed.
+- **Reuse starts new branches from the remote's default**; plain `add` starts from the local default, which is stale after a merge.
+- **Sync aborts, nothing changed, on a real file where a link belongs.** Report the conflict and ask the principal which copy wins.
+- **`[copy]` files are overwritten only by `--reset`**, which skips copies identical to the root. Removing an entry from `[copy]` leaves the files and keeps them git-excluded until no worktree has one. To commit a copied file, find it under `# copy` in the managed block of `.bare/info/exclude` and `git add -f` it.
 - **Shared paths are git-excluded automatically** via a managed block in `.bare/info/exclude`, which is shared by all worktrees. Edit `.shared`, never that block.
-- **`info/exclude` has the lowest precedence.** A `!path` in a tracked `.gitignore` re-includes a shared link, so it shows as untracked and `git add -A` would commit the symlink. `sync` warns per worktree when this happens; the fix is in that repo's `.gitignore`.
-- **`convert` refuses** uncommitted tracked changes, detached HEAD, in-progress merge/rebase, submodules, and locked linked worktrees. Existing linked worktrees (e.g. a sibling `project.2` from `git worktree add`) move into the container under their flattened branch name and are reconnected with `git worktree repair`; stale ones are pruned first. Untracked and ignored files, and uncommitted changes in linked worktrees, are carried over. Sparse checkouts (`extensions.worktreeConfig`) work: `core.bare` goes into `.bare/config.worktree`, and the old sparse settings and patterns move to the new worktree.
-- **`convert` only renames**: the tree becomes the first worktree, `.git` becomes `.bare`, and the index (with skip-worktree/assume-unchanged bits) and HEAD reflog carry over. Nothing is copied or deleted. On failure it rolls every rename back; if the rollback itself stops, it prints where the tree and repository are. Ctrl-C cannot stop it between renames. A hard kill leaves `<repo>.git-wt-convert.json`; the next `git-wt convert <repo>` rolls that back first and asks for a rerun.
-- **`clone` is `git clone --no-checkout --separate-git-dir=.bare` + `core.bare true`, not `clone --bare`.** A bare clone copies every remote branch into `refs/heads` as local branches that fetch never updates, and writes no fetch refspec. This route leaves only the default branch local, everything else as `origin/*`, and `git worktree add <dir> <branch>` creates tracking branches on demand.
-- **Containers are movable.** `clone` and `convert` set `worktree.useRelativePaths`, so worktree links are relative. This enables `extensions.relativeWorktrees`, which older git versions cannot read; a GUI with an old bundled git will refuse the repo (Sublime Merge on this machine was confirmed working).
-- **`wtc` must be sourced, not run.** A script can't change its caller's directory, so `~/.bashrc` or `~/.zshrc` needs `source {{SKILL_DIR}}/Tools/wtc.sh`. `WTC_COMMAND` sets what starts in the worktree, evaluated by the shell (default `command claude`; `""` only changes directory). Put personal flags such as `--permission-mode auto` there, never in this repo.
+- **A `!path` in a tracked `.gitignore` beats `info/exclude`**; `sync` warns when it re-includes a shared link. The fix is in that repo's `.gitignore`.
+- **`convert` refuses** uncommitted tracked changes, detached HEAD, in-progress merge/rebase, submodules and locked linked worktrees. Existing linked worktrees move into the container under their flattened branch name; untracked, ignored and uncommitted files carry over; sparse checkouts work.
+- **`convert` only renames**, so nothing is copied or deleted and a failure rolls back. An interrupted run leaves `<repo>.git-wt-convert.json`, which the next `convert` rolls back first.
+- **Containers are movable** (`worktree.useRelativePaths`), which turns on `extensions.relativeWorktrees`; a GUI bundling an old git will refuse the repo.
+- **`wtc` must be sourced**: `source {{SKILL_DIR}}/Tools/wtc.sh` in `~/.bashrc` or `~/.zshrc`. `WTC_COMMAND` is what starts in the worktree (default `command claude`; `""` only changes directory); personal flags such as `--permission-mode auto` go there, never in this repo.
 - **`git wt --help` opens `man git-wt`** (git rewrites `--help` for every subcommand) and fails. Use `git wt -h` or `git-wt --help`.
 - **This is an installed copy; the source is `{{SOURCE_DIR}}`.** Change the tool there, run `bun test Tools/` in that folder, commit, then rerun the repo's `./setup`. Setup refuses to overwrite a copy that was edited in place, so carry any such edit over to the source first.
