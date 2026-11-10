@@ -1,6 +1,6 @@
 ---
 name: auto-review
-description: Unattended review-loop: same arguments, but the main agent decides every finding itself and applies the fix it would have recommended, without asking. "soft" (also weak, short, quick) runs 1 simplicity + 1 correctness round (the default); "strong" (also hard, long, detailed) runs 2 + 2. USE WHEN auto review, auto-review, autoreview, review and fix without asking, unattended review, auto-accept review findings, strong auto review, quick auto review. NOT FOR deciding each finding yourself (use review-loop) or a review explicitly asked to be one-shot.
+description: Runs review-loop unattended, with the same arguments, applying its own recommended fix for each finding instead of asking. USE WHEN auto review, review and fix without asking, unattended review. NOT FOR letting the user decide each finding (use review-loop), or a review explicitly asked to be one-shot.
 argument-hint: "[soft|strong] [uncommitted | vs <branch> | <paths...>]"
 ---
 

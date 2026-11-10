@@ -26,12 +26,15 @@ describe("auto-review stays in step with review-loop", () => {
       if (step && line.includes("AskUserQuestion")) expect(overridden).toContain(step);
     }
   });
+});
 
-  test.each([
-    ["auto-review", wrapper],
-    ["review-loop", loop],
-  ])("%s lists the depth synonyms", (_, skill) => {
-    expect(skill).toContain('"soft" (also weak, short, quick)');
-    expect(skill).toContain('"strong" (also hard, long, detailed)');
+describe("review-loop's description", () => {
+  // "quick review" only reaches the loop because the description lists it as a trigger.
+  test("lists every depth word step 1 accepts", () => {
+    const depth = loop.match(/^- \*\*Depth:\*\*.*$/m)?.[0] ?? "";
+    const words = new Set([...depth.matchAll(/`([a-z]+)`/g)].map((m) => m[1]));
+    const description = loop.match(/^description: .*$/m)?.[0] ?? "";
+    expect(words.size).toBeGreaterThan(0);
+    for (const word of words) expect(description).toContain(`${word} review`);
   });
 });

@@ -1,6 +1,6 @@
 ---
 name: review-loop
-description: Multi-round code review in two phases, simplicity first and correctness second. Each round starts a fresh read-only reviewer subagent. The main agent triages its findings, asks the user about each one with suggested fixes (the user can also write their own), applies the chosen fixes and starts the next round, then commits the fixes once at the end. "soft" (also weak, short, quick) runs 1 simplicity + 1 correctness round (the default); "strong" (also hard, long, detailed) runs 2 + 2. By default it reviews the current branch (commits plus uncommitted changes) against main/master. USE WHEN review loop, review my changes, simplicity review, correctness review, strong review, hard review, long review, detailed review, soft review, weak review, short review, quick review, review this branch, review before PR. NOT FOR a review explicitly asked to be one-shot, or applying fixes without being asked (use auto-review).
+description: Runs a multi-round code review, simplicity then correctness, at soft (default) or strong depth. Asks about each finding, applies the chosen fixes, then commits them. USE WHEN review loop, review my changes, review this branch, review before PR, simplicity review, correctness review, soft review, weak review, short review, quick review, strong review, hard review, long review, detailed review. NOT FOR a review explicitly asked to be one-shot, or applying fixes without asking (use auto-review).
 argument-hint: "[soft|strong] [uncommitted | vs <branch> | <paths...>]"
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: ha-spec
-description: Write a behavioral spec for a Home Assistant change, from one automation to a stateful system (queues, modes, schedulers), for a separate Claude Code session on the Home Assistant box to implement. Use when the user designs or plans Home Assistant functionality from a machine that is NOT the Home Assistant instance: "write a HA spec", "spec out an automation", "design a Home Assistant dashboard/automation/script/feature". NOT FOR writing YAML, templates or config the user will paste in themselves, or Home Assistant how-to questions.
+description: Writes a behavioral spec for a Home Assistant change (an automation, script, dashboard or stateful system) that a separate Claude session on the Home Assistant box implements. USE WHEN write a HA spec, spec out an automation, design a Home Assistant dashboard, plan a Home Assistant feature. NOT FOR YAML, templates or config the user pastes in themselves, or Home Assistant how-to questions.
 ---
 
 # Home Assistant Spec Authoring

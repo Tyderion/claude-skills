@@ -1,7 +1,7 @@
 ---
 name: {{SKILL_NAME}}
 version: 1.0.0
-description: Bare-repo worktree containers via the git-wt CLI and the wtc shell function: clone into <container>/.bare + one folder per branch, convert a checkout in place, add a worktree per branch, reuse a merged worktree for a new branch (keeps node_modules), share files like .env across worktrees, and prune merged local branches and their worktrees (squash merges included). USE WHEN clone a repo, clone into coding, set up a repo, bare repo, .bare, git worktree, new worktree, work on two branches at once, reuse or recycle a worktree, avoid reinstalling dependencies, convert repo to worktrees, share .env across worktrees, prune branches, delete merged branches, clean up old branches, clean up merged worktrees, delete superseded worktree, interactive prune, git-wt, wtc, start Claude in a worktree. NOT FOR general git history work.
+description: Manages git repos as bare-repo worktree containers, a .bare repo plus one folder per branch. USE WHEN clone a repo, set up a repo, bare repo, git worktree, new worktree, work on two branches at once, reuse a worktree, avoid reinstalling dependencies, convert repo to worktrees, share .env across worktrees, prune branches, delete merged branches, clean up merged worktrees, start Claude in a worktree, git-wt, wtc. NOT FOR general git history work.
 ---
 
 # {{SKILL_NAME}}
