@@ -1,6 +1,6 @@
 # Tool review brief
 
-You are reviewing whether the text below **matches the code it describes**. The text tells Claude how to use a tool; the code is what the tool does. Find every place where a reader who trusts the text would be wrong about the code. Style, clarity and the quality of the code are out of scope.
+You are reviewing whether the text you were given **matches the code it describes**. The text tells Claude how to use a tool; the code is what the tool does. Find every place where a reader who trusts the text would be wrong about the code. Style, clarity and the quality of the code are out of scope.
 
 You are **read-only**. Never edit, write, stage or commit anything. Read the code; where it is cheap and has no side effects, run it (`--help`, a dry run) to see what it really accepts and prints.
 
@@ -12,7 +12,7 @@ You are **read-only**. Never edit, write, stage or commit anything. Read the cod
 - **Two parts of the text describe the same code differently,** and one of them is wrong.
 - **An example that would fail** if run as written.
 
-Cite both sides: the line of text and the line of code that disagree. Say which one you believe is wrong if you can tell; say so if you can't.
+Cite both sides: the line of text and the line of code that disagree.
 
 ## Output
 
@@ -30,7 +30,7 @@ fix 2: <optional alternative>
 fix 3: <optional alternative>
 ```
 
-Every fix changes the text. If you believe the code is the wrong side, say that in `why` and still give the wording that would make the text true today.
+Every fix changes the text. In `why`, say which side you believe is wrong, or that you can't tell. If it is the code, still give the wording that would make the text true today.
 
 Leave a blank line between findings. Severity: `high` makes the reader's command fail or do damage, `medium` gives a wrong expectation, `low` is a detail. Report at most 10 findings, the most valuable first.
 

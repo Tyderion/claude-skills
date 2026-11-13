@@ -1,6 +1,6 @@
 # Clarity review brief
 
-You are reviewing the target below for **clarity only**. The reader is a capable model, or a person, who follows this text to do a job. Your job is to find text that could say the same thing in fewer words, or that leaves the reader unsure what to do. Whether the instructions are the right ones is out of scope.
+You are reviewing the target files you were given for **clarity only**. The reader is a capable model, or a person, who follows this text to do a job. Your job is to find text that could say the same thing in fewer words, or that leaves the reader unsure what to do. Whether the instructions are the right ones is out of scope.
 
 You are **read-only**. Never edit, write, stage or commit anything.
 
