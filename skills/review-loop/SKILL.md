@@ -8,23 +8,23 @@ argument-hint: "[soft|strong] [uncommitted | vs <branch> | <paths...>]"
 
 ## 1. Parse the arguments
 
-Arguments: `$ARGUMENTS` (none means every default below).
+Arguments: `$ARGUMENTS`. If that is empty, take depth and target from the user's request; whatever it doesn't state takes the default below.
 
 - **Depth:** `strong` (also `hard`, `long`, `detailed`) means 2 simplicity rounds, then 2 correctness rounds. `soft` (also `weak`, `short`, `quick`) means 1 + 1. If neither is given, use `soft`. A bare depth word is always the depth, even if a file has that name; write `./quick` to target the file.
-- **Target:** the default is **branch vs base**. `uncommitted` (also "uncommitted files", "working tree") means **uncommitted only**. `vs <ref>` or `base <ref>` means **branch vs** the named ref. Paths on their own mean **paths**: the named files, and every file under a named directory, reviewed in full. Paths after `uncommitted` or `vs` restrict that scope to them: `-- <paths>` on both the diff and the untracked listing.
+- **Target:** the default is **branch vs base**. `uncommitted` (also "uncommitted files", "working tree") means **uncommitted only**. `vs <ref>` or `base <ref>` means **branch vs** the named ref. Paths on their own mean **paths**: the named files, and under a named directory every file `git ls-files --cached --others --exclude-standard -- <dir>` lists (every file, outside a git repo), reviewed in full. A bare word that is no existing path but resolves as a ref means `vs <ref>`. Paths after `uncommitted` or `vs` restrict that scope to them: `-- <paths>` on both the diff and the untracked listing.
 
 ## 2. Resolve the target once and freeze it
 
-Run each git command in its own `Bash` call and paste its result into the next as a literal; no `$(...)` substitution, which some harnesses flag.
+Run each git command in its own `Bash` call and paste its result into the next as a literal; no `$(...)` substitution, which some harnesses flag. Get the repo root from `git rev-parse --show-toplevel` and run every later git command as `git -C <root> …`, so all paths are root-relative even when the session started in a subdirectory.
 
 **Branch vs base** (the default):
 
 1. If the user named a ref, use it. Otherwise pick the first of these that resolves: `git symbolic-ref --quiet --short refs/remotes/origin/HEAD`, then `git rev-parse --verify --quiet` on each of `origin/main`, `origin/master`, `main`, `master`. If nothing resolves, ask the user which branch to use.
-2. `git merge-base HEAD <base>` gives the **fork-point SHA**. Freeze it for the whole run.
+2. `git merge-base HEAD <base>` gives the **fork-point SHA**. Freeze it for the whole run. If it fails (unrelated or shallow history), say so and ask for a base or for paths.
 3. The review scope is `git diff <sha>`, plus the untracked files listed by `git ls-files --others --exclude-standard`.
 4. If the fork point equals `HEAD`, tell the user only uncommitted changes are in scope.
 
-**Uncommitted only:** freeze the SHA from `git rev-parse HEAD`. The scope is `git diff <sha>` plus the untracked files.
+**Uncommitted only:** freeze the SHA from `git rev-parse HEAD`. The scope is `git diff <sha>` plus the untracked files. If the repo has no commits yet, say so and ask for paths.
 
 **Not a git repo:** only the paths target works. Ask for paths if none were given.
 
@@ -43,7 +43,7 @@ For each round, start one fresh `Agent` (general-purpose). Build its prompt from
 - the brief for the current phase, read from this skill's folder: `SimplicityBrief.md` or `CorrectnessBrief.md`
 - the repo root and the frozen target: for a git target, both the exact diff command with the literal SHA and the untracked-files command, each ending in `-- <paths>` if the user restricted it; for a paths target, the list of paths
 - the **declined list**: findings the user skipped in earlier rounds of this run, as `file:line — problem` so the fresh reviewer can match them, with a line telling it not to raise them again
-- a line saying this is round k of N for this phase
+- the **decided list**, once there is one: findings fixed earlier in this run, each with the fix chosen, with a line telling the reviewer not to propose a different fix for them and to check those changes for new problems
 
 ### 3b. Triage before asking
 
@@ -53,7 +53,7 @@ Read the cited code yourself before forwarding any finding, and drop it if:
 
 - the claim is wrong
 - it duplicates another finding
-- it is already on the declined list
+- it is already on the declined list, or reopens a finding on the decided list
 - it is out of scope (a problem the target neither contains nor causes, or the wrong phase)
 
 ### 3c. Ask the user
@@ -66,7 +66,7 @@ Use `AskUserQuestion`, one question per finding, most severe first.
 
 ### 3d. Apply the decisions
 
-- Add skipped findings to the declined list.
+- Add skipped findings to the declined list, and fixed ones to the decided list.
 - Apply every chosen fix. A free-text answer is the instruction for that finding; where it is ambiguous, pick the reading that fits the finding and mention that you did.
 - Do not commit or stage yet; step 4 does that once.
 - Then re-run the checks. If one reports a failure that wasn't in the record from before round 1, repair the code or revert the fix that caused it before the next round, and tell the user which fix and what you did. Revert by reversing your own edits. Never use `git restore`, `git checkout --`, `git stash` or `git reset`: nothing is committed yet, so they also discard the user's uncommitted work and every earlier fix in that file.

@@ -10,7 +10,7 @@ Runs review-loop without stopping to ask; the main agent's recommendation stands
 
 ## 1. Load review-loop
 
-Load the `review-loop` skill with the `Skill` tool and pass the arguments through unchanged: `$ARGUMENTS`. Some installs prefix it as `_review-loop`; use the name your skill list shows.
+Load the `review-loop` skill with the `Skill` tool and pass the arguments through unchanged: `$ARGUMENTS`. If there are none, pass the depth and target words from the user's request. Some installs prefix it as `_review-loop`; use the name your skill list shows.
 
 If it isn't available, stop and say so.
 
