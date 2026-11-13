@@ -75,7 +75,7 @@ Use `AskUserQuestion`, one question per finding, most severe first.
 
 After the last round, make one commit of the fixes. Never push.
 
-Leave out every file noted as dirty before round 1, and leave out a fix whole if it touched any of them: none of its files go in, so the commit never holds half a fix. Commit the rest with `git add -- <paths>`, then `git commit --only -m "<message>" -- <paths>`, so anything else already staged stays out. If no paths remain, or the target isn't in a git repo, skip the commit and say so. If a commit hook fails, leave the fixes uncommitted and report it; don't bypass it with `--no-verify`.
+Leave out every file noted as dirty before round 1, and leave out a fix whole if it touched any of them: none of its files go in, so the commit never holds half a fix. Commit the rest with `git add -- <paths>`, then `git commit --only -m "<message>" -- <paths>`, so anything else already staged stays out. If no paths remain, the target isn't in a git repo, or HEAD is detached or on the default branch (the base step 2 would pick), skip the commit, leave the fixes in the working tree and say so. If a commit hook fails, leave the fixes uncommitted and report it; don't bypass it with `--no-verify`.
 
 ## 5. Final report
 
